@@ -2,6 +2,5 @@ numpy
 matplotlib
 torch
 torch_geometric
-torch_scatter
 kingdon
 tqdm
