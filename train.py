@@ -34,7 +34,7 @@ from tqdm import tqdm
 from pipeline import FlowFieldPipeline
 
 # ==== CONFIG ====
-DATA_DIR = Path("data/airfrans_gatr")
+DATA_DIR = Path("/kaggle/input/datasets/reddy42/gatr-aerfrans/airfrans_gatr")
 CHECKPOINT_DIR = Path("checkpoints")
 SEED = 0
 
