@@ -39,7 +39,7 @@ CHECKPOINT_DIR = Path("checkpoints")
 SEED = 0
 
 VAL_FRACTION = 0.1
-EPOCHS = 100
+EPOCHS = 25
 LR = 3e-4
 WEIGHT_DECAY = 1e-5
 GRAD_ACCUM_STEPS = 4          # samples per optimizer step (point-cloud graphs vary in size -> batch_size=1 loader)
@@ -47,9 +47,9 @@ GRAD_CLIP_NORM = 1.0
 WARMUP_EPOCHS = 5             # linear LR warmup before cosine decay — stabilizes early training
 EARLY_STOP_PATIENCE = 20      # stop if val_loss hasn't improved in this many epochs
 
-MV_CHANNELS = 4
-SCALAR_CHANNELS = 8
-N_HEADS = 2
+MV_CHANNELS = 8
+SCALAR_CHANNELS = 16
+N_HEADS = 4
 N_ENCODER_LAYERS = 4
 # Grid covers the observed coordinate range (x: [-2.16, 4.23], y: [-1.62, 1.62]
 # from a 20-sample check) with margin for the rest of the dataset, and
