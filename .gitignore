@@ -1,0 +1,42 @@
+# Datasets and raw data directories
+data/
+datasets/
+processed/
+raw/
+*.pt
+*.pth
+*.pkl
+*.pickle
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.csv
+*.tsv
+*.tar.gz
+*.zip
+
+# CAD and mesh files
+*.step
+*.stp
+*.iges
+*.igs
+*.stl
+*.obj
+*.vtk
+*.vtp
+
+# Python and Environment caches
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+.venv
+env/
+venv/
+.ipynb_checkpoints/
+
+# IDE files
+.idea/
+.vscode/
+.DS_Store
