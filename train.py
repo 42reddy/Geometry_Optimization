@@ -33,13 +33,13 @@ from tqdm import tqdm
 
 from pipeline import FlowFieldPipeline
 
-# ==== CONFIG ====
-DATA_DIR = Path("data/airfrans_gatr")
+# CONFIG
+DATA_DIR = Path("/kaggle/input/datasets/reddy42/gatr-aerfrans/airfrans_gatr")
 CHECKPOINT_DIR = Path("checkpoints")
 SEED = 0
 
 VAL_FRACTION = 0.1
-EPOCHS = 100
+EPOCHS = 25
 LR = 3e-4
 WEIGHT_DECAY = 1e-5
 GRAD_ACCUM_STEPS = 4          # samples per optimizer step (point-cloud graphs vary in size -> batch_size=1 loader)
@@ -51,10 +51,7 @@ MV_CHANNELS = 4
 SCALAR_CHANNELS = 8
 N_HEADS = 2
 N_ENCODER_LAYERS = 4
-# Grid covers the observed coordinate range (x: [-2.16, 4.23], y: [-1.62, 1.62]
-# from a 20-sample check) with margin for the rest of the dataset, and
-# resolution is aspect-matched to the domain so grid cells stay close to
-# isotropic (dx ~ 0.0625, dy ~ 0.0688) rather than stretched.
+
 GRID_RESOLUTION = (64, 128)   # (H, W)
 GRID_BOUNDS = ((-3.0, 5.0), (-2.2, 2.2))   # ((x_min, x_max), (y_min, y_max))
 KNN_K = 16
@@ -64,7 +61,6 @@ FNO_LAYERS = 4
 FNO_MODES = 16
 
 VAL_EVERY = 1
-# ================
 
 
 def set_seed(seed: int) -> None:
