@@ -40,3 +40,9 @@ venv/
 .idea/
 .vscode/
 .DS_Store
+
+echo "eval_plots/" >> .gitignore
+
+# Optional: Ignore all image files across the repo
+echo "*.png" >> .gitignore
+echo "*.jpg" >> .gitignore

@@ -202,9 +202,15 @@ def save_sample(
     freestream: np.ndarray,
     velocity: np.ndarray,
     pressure: np.ndarray,
-    stats: dict
+    stats: dict,
+    coords_full: np.ndarray,
+    sdf_full: np.ndarray,
+    normals_full: np.ndarray,
+    velocity_full: np.ndarray,
+    pressure_full: np.ndarray,
 ) -> None:
-    """Save downsampled sample in NPZ format."""
+    """Save downsampled sample (for training) plus the full-resolution mesh
+    (for evaluation) in NPZ format."""
     sample_dir = output_dir / f"sample_{idx:05d}"
     sample_dir.mkdir(exist_ok=True)
 
@@ -227,6 +233,23 @@ def save_sample(
         velocity=velocity,
         pressure=pressure,
         log_v_inf=log_v_inf,
+    )
+
+    # Full ~180k-point mesh, nondimensionalized with the SAME v_inf_mag as the
+    # downsampled data above (see prepare_dataset: normalization happens once,
+    # before downsampling, so data.npz and full.npz can't drift apart in
+    # scaling). GridDecoder can be queried at arbitrary coordinates, so at
+    # eval time the model can be decoded onto these full-resolution points
+    # even though it only ever encodes the downsampled point cloud — this is
+    # what makes it possible to measure true full-mesh error instead of only
+    # error on the (boundary-heavy, therefore harder) training point cloud.
+    np.savez(
+        sample_dir / "full.npz",
+        coords=coords_full,
+        sdf=sdf_full,
+        normals=normals_full,
+        velocity=velocity_full,
+        pressure=pressure_full,
     )
 
     # Save stats as NPZ (needed to denormalize predictions back to physical units)
@@ -261,13 +284,18 @@ def prepare_dataset(
             airfrans_dataset, idx
         )
 
+        # Nondimensionalize the FULL-resolution fields first, then downsample
+        # the already-normalized arrays for training — this guarantees
+        # data.npz (downsampled) and full.npz (for eval) use identical
+        # scaling instead of risking two separate nondimensionalize() calls
+        # drifting apart.
+        normalized_full, stats = nondimensionalize(freestream, velocity, pressure)
+
         # Downsample
         coords_down, sdf_down, normals_down, vel_down, press_down, _ = boundary_aware_downsample(
-            coords, sdf, normals, velocity, pressure, target_points, BOUNDARY_RATIO
+            coords, sdf, normals, normalized_full['velocity'], normalized_full['pressure'],
+            target_points, BOUNDARY_RATIO
         )
-
-        # Nondimensionalize by freestream speed
-        normalized, stats = nondimensionalize(freestream, vel_down, press_down)
 
         # Save
         save_sample(
@@ -275,10 +303,15 @@ def prepare_dataset(
             coords_down,
             sdf_down,
             normals_down,
-            normalized['freestream'],
-            normalized['velocity'],
-            normalized['pressure'],
-            stats
+            normalized_full['freestream'],
+            vel_down,
+            press_down,
+            stats,
+            coords_full=coords,
+            sdf_full=sdf,
+            normals_full=normals,
+            velocity_full=normalized_full['velocity'],
+            pressure_full=normalized_full['pressure'],
         )
 
         # Track statistics (convert numpy types to Python native for JSON serialization)

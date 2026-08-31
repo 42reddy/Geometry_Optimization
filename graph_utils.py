@@ -6,6 +6,8 @@ point-cloud -> structured-grid projection step.
 import torch
 from torch_geometric.nn import knn_graph, knn
 
+from grid_stretch import AxisStretch
+
 
 def build_knn_graph(coords: torch.Tensor, k: int = 16, loop: bool = False) -> torch.Tensor:
     """
@@ -38,27 +40,44 @@ def build_bipartite_knn(point_coords: torch.Tensor, grid_coords: torch.Tensor, k
 def build_structured_grid(
     bounds: tuple = ((-3.0, 3.0), (-3.0, 3.0)),
     resolution: tuple = (64, 64),
+    stretch_center: tuple = (0.5, 0.0),
+    stretch_gamma: float = 3.0,
     device=None,
 ) -> tuple:
     """
-    Build a uniform Cartesian grid — the regular spacing FNO's FFT-based
-    spectral convolutions require. Unlike the boundary-aware point-cloud
-    downsampling used for GATr's input, this grid is NOT density-adaptive;
-    density-awareness happens upstream, via GridProjector reading from a
-    denser point-cloud region when a grid cell sits near the boundary.
+    Build a Cartesian grid on a REGULAR (H, W) index lattice — the uniform
+    indexing FNO's FFT-based spectral convolutions require — but with the
+    index -> physical coordinate mapping stretched (via AxisStretch) so grid
+    density is highest near `stretch_center` (the airfoil) and falls off
+    towards the domain edges, instead of uniform physical spacing. A real
+    AirfRANS mesh concentrates most of its points in a thin near-wall
+    boundary layer; a uniform grid can't represent that layer at all once
+    its cells are wider than the layer itself, no matter how the point cloud
+    fed into GridProjector is sampled. This fixes the representation, not
+    just the sampling. Set stretch_gamma=0 to recover a uniform grid.
 
-    bounds     : ((x_min, x_max), (y_min, y_max)) — should cover the
-                 normalized coordinate range of your prepared dataset
-    resolution : (H, W) grid resolution
+    bounds         : ((x_min, x_max), (y_min, y_max)) — should cover the
+                     normalized coordinate range of your prepared dataset
+    resolution     : (H, W) requested grid resolution (may be adjusted by a
+                     few cells due to rounding in the stretch split)
+    stretch_center : (x_center, y_center) — where grid density is highest;
+                     default (0.5, 0.0) is mid-chord, on the chord line
+    stretch_gamma  : clustering strength (0 = uniform, 3-5 = strong)
 
     Returns:
         grid_coords : (H*W, 2) flattened grid cell coordinates
-        H, W        : grid resolution, for reshaping features back to (H, W, ...)
+        H, W        : actual grid resolution, for reshaping features back to (H, W, ...)
     """
     (x_min, x_max), (y_min, y_max) = bounds
     H, W = resolution
-    xs = torch.linspace(x_min, x_max, W, device=device)
-    ys = torch.linspace(y_min, y_max, H, device=device)
+    cx, cy = stretch_center
+
+    x_stretch = AxisStretch(x_min, x_max, cx, stretch_gamma, W)
+    y_stretch = AxisStretch(y_min, y_max, cy, stretch_gamma, H)
+    xs = x_stretch.physical_coords(device=device)
+    ys = y_stretch.physical_coords(device=device)
+    W, H = x_stretch.n, y_stretch.n
+
     grid_y, grid_x = torch.meshgrid(ys, xs, indexing='ij')   # (H, W)
     grid_coords = torch.stack([grid_x, grid_y], dim=-1).reshape(-1, 2)   # (H*W, 2)
     return grid_coords, H, W

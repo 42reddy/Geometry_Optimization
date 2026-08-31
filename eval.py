@@ -4,6 +4,20 @@ split (the exact same split train.py produced, reconstructed here with the
 same SEED — evaluating on training samples would give falsely optimistic
 metrics).
 
+The model still ENCODES the downsampled ~9k point cloud from data.npz (its
+trained input distribution) via encode_to_grid(), but is DECODED at the full
+~180k-point mesh from full.npz (written by prepare_gatr.py, nondimensionalized
+identically to data.npz). This measures true full-resolution error instead of
+error on the training point cloud, which is disproportionately boundary-heavy
+(and therefore disproportionately hard) relative to the full mesh — the easy,
+smooth far-field points that the model already predicts well are 20x
+underrepresented in the 9k cloud, so error measured there understates how
+good the model actually is. GridDecoder is a continuous bilinear interpolant,
+so querying it at points other than the encoder's input is exactly what it's
+designed for. Falls back to downsampled-only evaluation (with a warning) if
+full.npz isn't present, e.g. for data prepared before this eval mode existed.
+
+
 Two kinds of quantities are reported, and they are NOT interchangeable:
 
   - Cl, Cd (lift/drag coefficients) are dimensionless. They are computed
@@ -72,7 +86,10 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from train import AirfRANSGATrDataset, set_seed, SEED, VAL_FRACTION, CHECKPOINT_DIR, DATA_DIR, GRID_BOUNDS
+from train import (
+    AirfRANSGATrDataset, set_seed, SEED, VAL_FRACTION, CHECKPOINT_DIR, DATA_DIR,
+    GRID_BOUNDS, GRID_RESOLUTION, GRID_STRETCH_CENTER, GRID_STRETCH_GAMMA,
+)
 from pipeline import FlowFieldPipeline
 
 # CONFIG
@@ -102,8 +119,10 @@ def load_model(checkpoint_path: Path) -> nn.Module:
         scalar_channels=8,
         n_heads=2,
         n_encoder_layers=4,
-        grid_resolution=(64, 128),
+        grid_resolution=GRID_RESOLUTION,
         grid_bounds=GRID_BOUNDS,
+        grid_stretch_center=GRID_STRETCH_CENTER,
+        grid_stretch_gamma=GRID_STRETCH_GAMMA,
         knn_k=16,
         bipartite_k=8,
         fno_hidden_channels=32,
@@ -192,6 +211,79 @@ def compute_sample_metrics(
         'p_rms': float(np.sqrt(np.mean((p_pred_phys_b - p_targ_phys_b) ** 2))) if len(n_b) else float('nan'),
         'n_boundary': int(np.sum(boundary_mask)),
     }
+
+
+# SDF magnitude bands used to stratify field error by distance from the
+# airfoil surface. RANS meshes are heavily refined right at the wall (to
+# resolve the boundary layer), so a huge fraction of the full ~180k-point
+# mesh sits in the first band — a single pooled relative-L2 error over the
+# whole mesh is dominated by however well the model does there, and hides
+# whether the rest of the field is actually fine.
+SDF_BANDS = [
+    (0.0, 0.01, "|sdf|<0.01 (near-wall)"),
+    (0.01, 0.05, "0.01<=|sdf|<0.05"),
+    (0.05, 0.1, "0.05<=|sdf|<0.1"),
+    (0.1, 0.5, "0.1<=|sdf|<0.5"),
+    (0.5, float('inf'), "|sdf|>=0.5 (far-field)"),
+]
+
+
+def new_band_accumulator() -> dict:
+    return {
+        label: {'sq_err_ux': 0.0, 'sq_targ_ux': 0.0,
+                'sq_err_uy': 0.0, 'sq_targ_uy': 0.0,
+                'sq_err_p': 0.0, 'sq_targ_p': 0.0,
+                'n_points': 0}
+        for _, _, label in SDF_BANDS
+    }
+
+
+def accumulate_band_stats(
+    band_stats: dict,
+    sdf: np.ndarray,
+    velocity_pred_norm: np.ndarray,
+    velocity_targ_norm: np.ndarray,
+    pressure_pred_norm: np.ndarray,
+    pressure_targ_norm: np.ndarray,
+) -> None:
+    """Pool squared-error / squared-target sums per SDF band across every
+    point of every sample — relative L2 error is a global norm ratio, not a
+    mean of per-sample ratios, so bands with few points in one sample still
+    get folded in correctly at the end instead of being averaged unweighted."""
+    abs_sdf = np.abs(sdf)
+    for lo, hi, label in SDF_BANDS:
+        mask = (abs_sdf >= lo) & (abs_sdf < hi)
+        if not mask.any():
+            continue
+        b = band_stats[label]
+        b['sq_err_ux'] += float(np.sum((velocity_pred_norm[mask, 0] - velocity_targ_norm[mask, 0]) ** 2))
+        b['sq_targ_ux'] += float(np.sum(velocity_targ_norm[mask, 0] ** 2))
+        b['sq_err_uy'] += float(np.sum((velocity_pred_norm[mask, 1] - velocity_targ_norm[mask, 1]) ** 2))
+        b['sq_targ_uy'] += float(np.sum(velocity_targ_norm[mask, 1] ** 2))
+        b['sq_err_p'] += float(np.sum((pressure_pred_norm[mask] - pressure_targ_norm[mask]) ** 2))
+        b['sq_targ_p'] += float(np.sum(pressure_targ_norm[mask] ** 2))
+        b['n_points'] += int(mask.sum())
+
+
+def print_band_breakdown(band_stats: dict) -> None:
+    """Relative L2 error per SDF band, pooled over every point/sample in
+    that band — shows whether error is concentrated near the wall (mesh-
+    refinement artifact) or spread through the field (a real model gap)."""
+    total_points = sum(b['n_points'] for b in band_stats.values())
+    print("\nRelative L2 error by distance-to-surface band "
+          "(pooled over all points/samples in each band):")
+    print(f"  {'band':26s}  {'n_points':>10s}  {'%':>6s}  {'e_ux':>8s}  {'e_uy':>8s}  {'e_p':>8s}")
+    for _, _, label in SDF_BANDS:
+        b = band_stats[label]
+        n = b['n_points']
+        if n == 0:
+            print(f"  {label:26s}  {'(no points)':>10s}")
+            continue
+        e_ux = (b['sq_err_ux'] / (b['sq_targ_ux'] + EPS)) ** 0.5
+        e_uy = (b['sq_err_uy'] / (b['sq_targ_uy'] + EPS)) ** 0.5
+        e_p = (b['sq_err_p'] / (b['sq_targ_p'] + EPS)) ** 0.5
+        pct = 100 * n / total_points if total_points else 0.0
+        print(f"  {label:26s}  {n:10d}  {pct:5.1f}%  {e_ux:8.4f}  {e_uy:8.4f}  {e_p:8.4f}")
 
 
 def print_distribution(name: str, values: np.ndarray, unit: str = "") -> None:
@@ -445,6 +537,16 @@ def main():
                                     'Cd_pred', 'Cd_targ', 'v_rms', 'p_rms']}
     sample_records = []  # (global_idx, v_inf_mag, coords_np, sdf, phys fields, metrics) for plotting later
     pooled_v_err, pooled_p_err = [], []
+    band_stats = new_band_accumulator()
+
+    full_res_available = False #(dataset.sample_dirs[0] / "full.npz").exists()
+    if full_res_available:
+        print("full.npz found — evaluating against the FULL ~180k-point mesh "
+              "(model still encodes only the downsampled ~9k input cloud).\n")
+    else:
+        print("WARNING: full.npz not found — falling back to evaluating on the "
+              "downsampled ~9k point cloud only. Rerun prepare_gatr.py to get "
+              "true full-resolution metrics.\n")
 
     print(f"Evaluating {len(val_set)} samples...")
     with torch.no_grad():
@@ -456,19 +558,31 @@ def main():
             node_scalars = node_scalars.squeeze(0).to(DEVICE)
             target = target.squeeze(0).to(DEVICE)
 
-            pred = model(coords, node_scalars, coords)
+            fno_out = model.encode_to_grid(coords, node_scalars)
 
-            coords_np = coords.cpu().numpy()
+            if full_res_available:
+                full = np.load(sample_dir / "full.npz")
+                query_coords = torch.from_numpy(full['coords']).float().to(DEVICE)
+                sdf = full['sdf']
+                normals = full['normals']
+                target_np = np.concatenate(
+                    [full['velocity'], full['pressure'][:, None]], axis=-1
+                )
+            else:
+                query_coords = coords
+                sdf = node_scalars[:, 2].cpu().numpy()
+                normals = node_scalars[:, 3:5].cpu().numpy()
+                target_np = target.cpu().numpy()
+
+            pred = model.decode(fno_out, query_coords)
+
+            coords_np = query_coords.cpu().numpy()
             pred_np = pred.cpu().numpy()
-            target_np = target.cpu().numpy()
 
             velocity_pred_norm = pred_np[:, :2]
             velocity_targ_norm = target_np[:, :2]
             pressure_pred_norm = pred_np[:, 2]
             pressure_targ_norm = target_np[:, 2]
-
-            sdf = node_scalars[:, 2].cpu().numpy()
-            normals = node_scalars[:, 3:5].cpu().numpy()
 
             stats = np.load(sample_dir / "stats.npz")
             v_inf_mag = float(stats['v_inf_mag'])
@@ -487,6 +601,12 @@ def main():
             )
             for k in all_metrics:
                 all_metrics[k].append(m[k])
+
+            accumulate_band_stats(
+                band_stats, sdf,
+                velocity_pred_norm, velocity_targ_norm,
+                pressure_pred_norm, pressure_targ_norm,
+            )
 
             v_mag_pred = np.linalg.norm(velocity_pred_phys, axis=1)
             v_mag_targ = np.linalg.norm(velocity_targ_phys, axis=1)
@@ -523,6 +643,8 @@ def main():
     print("\nPhysical-unit RMS error per sample:")
     print_distribution("velocity", np.array(all_metrics['v_rms']), unit=" m/s")
     print_distribution("pressure (surface)", np.array(all_metrics['p_rms']), unit=" m²/s²")
+
+    print_band_breakdown(band_stats)
 
     Cl_pred_arr = np.array(all_metrics['Cl_pred'])
     Cl_targ_arr = np.array(all_metrics['Cl_targ'])

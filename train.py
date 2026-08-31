@@ -81,11 +81,21 @@ SCALAR_CHANNELS = 8
 N_HEADS = 2
 N_ENCODER_LAYERS = 4
 # Grid covers the observed coordinate range (x: [-2.16, 4.23], y: [-1.62, 1.62]
-# from a 20-sample check) with margin for the rest of the dataset, and
-# resolution is aspect-matched to the domain so grid cells stay close to
-# isotropic (dx ~ 0.0625, dy ~ 0.0688) rather than stretched.
-GRID_RESOLUTION = (64, 128)   # (H, W)
+# from a 20-sample check) with margin for the rest of the dataset.
+# Resolution bumped from (64, 128) now that the grid is stretched (below) —
+# a uniform grid this size has cells ~10x wider than the near-wall
+# boundary-layer band the full mesh concentrates points in, so no amount of
+# resolution alone (without stretching) would have fixed that; this increase
+# mainly buys sharper representation everywhere else now that near-wall
+# density is handled by the stretch. Raise further if GPU memory allows —
+# GridProjector's bipartite attention cost scales with H*W*bipartite_k.
+GRID_RESOLUTION = (96, 192)   # (H, W)
 GRID_BOUNDS = ((-3.0, 5.0), (-2.2, 2.2))   # ((x_min, x_max), (y_min, y_max))
+# Grid density is concentrated here (mid-chord, on the chord line) and falls
+# off towards the domain edges — see grid_stretch.py. GRID_STRETCH_GAMMA=0
+# recovers the old uniform grid.
+GRID_STRETCH_CENTER = (0.5, 0.0)
+GRID_STRETCH_GAMMA = 3.0
 KNN_K = 16
 BIPARTITE_K = 8
 FNO_HIDDEN_CHANNELS = 32
@@ -262,6 +272,8 @@ def main():
         n_encoder_layers=N_ENCODER_LAYERS,
         grid_resolution=GRID_RESOLUTION,
         grid_bounds=GRID_BOUNDS,
+        grid_stretch_center=GRID_STRETCH_CENTER,
+        grid_stretch_gamma=GRID_STRETCH_GAMMA,
         knn_k=KNN_K,
         bipartite_k=BIPARTITE_K,
         fno_hidden_channels=FNO_HIDDEN_CHANNELS,

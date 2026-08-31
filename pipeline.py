@@ -28,6 +28,8 @@ class FlowFieldPipeline(nn.Module):
         n_encoder_layers: int = 4,
         grid_resolution: tuple = (64, 64),
         grid_bounds: tuple = ((-3.0, 3.0), (-3.0, 3.0)),
+        grid_stretch_center: tuple = (0.5, 0.0),
+        grid_stretch_gamma: float = 3.0,
         knn_k: int = 16,
         bipartite_k: int = 8,
         fno_hidden_channels: int = 32,
@@ -47,9 +49,14 @@ class FlowFieldPipeline(nn.Module):
         self.fno = FNO2d(fno_in_channels, fno_hidden_channels, n_outputs,
                           fno_layers, fno_modes, fno_modes)
 
-        self.grid_decoder = GridDecoder(grid_bounds)
+        grid_coords, self.H, self.W = build_structured_grid(
+            grid_bounds, grid_resolution, grid_stretch_center, grid_stretch_gamma
+        )
+        # GridDecoder needs the SAME actual (H, W) build_structured_grid ended up
+        # with (rounding in the stretch split can shift it a few cells from the
+        # requested resolution) so its inverse mapping lands on the same lattice.
+        self.grid_decoder = GridDecoder(grid_bounds, (self.H, self.W), grid_stretch_center, grid_stretch_gamma)
 
-        grid_coords, self.H, self.W = build_structured_grid(grid_bounds, grid_resolution)
         self.register_buffer('grid_coords', grid_coords)
         self.register_buffer('grid_mvs', encode_points_batch_torch(grid_coords))
 

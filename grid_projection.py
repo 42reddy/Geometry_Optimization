@@ -14,6 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from EquiLinear import EquivariantLinear
 from torch_scatter import scatter_softmax, scatter_add
+from grid_stretch import AxisStretch
 
 METRIC_INDICES = [0, 2, 3, 4, 8, 9, 10, 14, 15]
 
@@ -167,13 +168,20 @@ class GridDecoder(nn.Module):
     including the full original ~180k-point mesh, even though GATr/FNO only
     ever computed on the downsampled training point cloud — input
     compression and output supervision resolution are decoupled.
+
+    The grid is stretched (AxisStretch, matching build_structured_grid) so
+    the index -> physical mapping is nonlinear; query coordinates must go
+    through the SAME per-axis inverse mapping to land on the right
+    normalized grid_sample position, not a plain linear rescale.
     """
 
-    def __init__(self, bounds):
+    def __init__(self, bounds, resolution, stretch_center=(0.5, 0.0), stretch_gamma=3.0):
         super().__init__()
         (x_min, x_max), (y_min, y_max) = bounds
-        self.x_min, self.x_max = x_min, x_max
-        self.y_min, self.y_max = y_min, y_max
+        H, W = resolution
+        cx, cy = stretch_center
+        self.x_stretch = AxisStretch(x_min, x_max, cx, stretch_gamma, W)
+        self.y_stretch = AxisStretch(y_min, y_max, cy, stretch_gamma, H)
 
     def forward(self, grid_field, query_coords):
         """
@@ -181,8 +189,8 @@ class GridDecoder(nn.Module):
         query_coords : (B, N, 2)     (x, y) points to evaluate the field at
         Returns      : (B, N, C)     interpolated field values at each point
         """
-        x = (query_coords[..., 0] - self.x_min) / (self.x_max - self.x_min) * 2 - 1
-        y = (query_coords[..., 1] - self.y_min) / (self.y_max - self.y_min) * 2 - 1
+        x = self.x_stretch.to_norm(query_coords[..., 0])
+        y = self.y_stretch.to_norm(query_coords[..., 1])
         norm_coords = torch.stack([x, y], dim=-1).unsqueeze(1)   # (B, 1, N, 2)
 
         sampled = F.grid_sample(
