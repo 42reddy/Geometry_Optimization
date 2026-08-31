@@ -125,7 +125,7 @@ class AirfRANSGATrDataset(Dataset):
         return len(self.sample_dirs)
 
     def __getitem__(self, idx: int):
-        data = np.load(self.sample_dirs[idx] / "data.npz")
+        data = np.load(self.sample_dirs[idx] / "full.npz")
         coords = torch.from_numpy(data['coords']).float()
         sdf = torch.from_numpy(data['sdf']).float()
         normals = torch.from_numpy(data['normals']).float()
