@@ -15,7 +15,7 @@ AIRFRANS_DIR = Path("data/airfrans")
 OUTPUT_DIR = Path("data/airfrans_gatr")
 N_SAMPLES = None  # None = all, or int for subset
 TARGET_POINTS = 9000  # downsample target
-BOUNDARY_RATIO = 0.65  # 65% of samples from boundary, 35% from field
+BOUNDARY_RATIO = 0.80  # 80% of samples from boundary, 35% from field
 VOXEL_PREFILTER_FACTOR = 3  # pre-filter boundary set to ~factor*n_boundary before FPS
 # ================
 
@@ -76,7 +76,7 @@ def boundary_aware_downsample(
     velocity: np.ndarray,
     pressure: np.ndarray,
     target_points: int,
-    boundary_ratio: float = 0.65
+    boundary_ratio: float = 0.80
 ):
     """
     Intelligently downsample while preserving boundary geometry.
@@ -208,6 +208,15 @@ def save_sample(
     sample_dir = output_dir / f"sample_{idx:05d}"
     sample_dir.mkdir(exist_ok=True)
 
+    # log(|V_inf|) as an extra broadcast scalar feature: `freestream` above is
+    # already divided by |V_inf|, so it only carries the AoA direction — the
+    # flow *speed* (and therefore Reynolds number, since AirfRANS varies
+    # viscosity much less than inlet speed) would otherwise never reach the
+    # model, even though the nondimensional flow shape still depends on Re.
+    # log-scale keeps the range small (AirfRANS speeds ~10-80 m/s -> ~2.3-4.4)
+    # without needing dataset-wide normalization stats.
+    log_v_inf = np.array(np.log(stats['v_inf_mag']), dtype=np.float32)
+
     # Save as NPZ (single binary file with multiple arrays)
     np.savez(
         sample_dir / "data.npz",
@@ -216,7 +225,8 @@ def save_sample(
         normals=normals,
         freestream=freestream,
         velocity=velocity,
-        pressure=pressure
+        pressure=pressure,
+        log_v_inf=log_v_inf,
     )
 
     # Save stats as NPZ (needed to denormalize predictions back to physical units)

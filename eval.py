@@ -97,7 +97,7 @@ THRESHOLDS = {
 
 def load_model(checkpoint_path: Path) -> nn.Module:
     model = FlowFieldPipeline(
-        input_scalar_dim=5,
+        input_scalar_dim=6,
         mv_channels=4,
         scalar_channels=8,
         n_heads=2,

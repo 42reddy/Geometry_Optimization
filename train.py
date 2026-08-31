@@ -9,6 +9,10 @@ Sample schema (per sample_XXXXX/data.npz, written by prepare_gatr.py):
     freestream (2,)    inlet velocity, nondimensionalized: freestream / |V_inf|
     velocity   (N, 2)  target velocity, nondimensionalized: velocity / |V_inf|
     pressure   (N,)    target pressure, nondimensionalized: pressure / |V_inf|^2
+    log_v_inf  ()      log(|V_inf|) — the flow-speed magnitude that gets
+                        divided out of `freestream` above; kept as a separate
+                        scalar feature since the nondimensional flow shape
+                        still depends on it (through Reynolds number).
 sample_XXXXX/stats.npz holds v_inf_mag, the freestream speed used for the
 nondimensionalization above (needed only to convert predictions back to
 physical units — training itself operates entirely in nondimensional space,
@@ -46,6 +50,21 @@ GRAD_ACCUM_STEPS = 4          # samples per optimizer step (point-cloud graphs v
 GRAD_CLIP_NORM = 1.0
 WARMUP_EPOCHS = 5             # linear LR warmup before cosine decay — stabilizes early training
 EARLY_STOP_PATIENCE = 20      # stop if val_loss hasn't improved in this many epochs
+
+# Per-channel loss weights [v_x, v_y, pressure]. Equal weighting let the
+# model minimize loss mostly by nailing v_x (largest-magnitude, smoothest
+# channel) while neglecting v_y and pressure, which are harder but not
+# proportionally louder in an unweighted MSE. Weighted up here so the
+# optimizer can't ignore them.
+LOSS_WEIGHTS = (1.0, 2.0, 3.0)
+
+# Weight on the incompressible-continuity residual (d(v_x)/dx + d(v_y)/dy = 0
+# at each query point), computed via autograd through GridDecoder's
+# differentiable bilinear interpolation. This is a soft physical constraint,
+# not a replacement for the data loss — kept small so it regularizes the
+# field towards a coherent (divergence-free) flow instead of dominating the
+# fit to data. Set to 0.0 to disable.
+PHYSICS_WEIGHT = 0.02
 
 MV_CHANNELS = 4
 SCALAR_CHANNELS = 8
@@ -93,10 +112,14 @@ class AirfRANSGATrDataset(Dataset):
         freestream = torch.from_numpy(data['freestream']).float()
         velocity = torch.from_numpy(data['velocity']).float()
         pressure = torch.from_numpy(data['pressure']).float()
+        log_v_inf = torch.tensor(float(data['log_v_inf']))
 
         n = coords.shape[0]
         freestream_bc = freestream.unsqueeze(0).expand(n, -1)   # broadcast to every node
-        node_scalars = torch.cat([freestream_bc, sdf.unsqueeze(-1), normals], dim=-1)   # (N, 5)
+        log_v_inf_bc = log_v_inf.expand(n).unsqueeze(-1)        # broadcast to every node
+        node_scalars = torch.cat(
+            [freestream_bc, sdf.unsqueeze(-1), normals, log_v_inf_bc], dim=-1
+        )   # (N, 6)
         target = torch.cat([velocity, pressure.unsqueeze(-1)], dim=-1)                   # (N, 3)
 
         return coords, node_scalars, target
@@ -117,16 +140,47 @@ def check_grid_bounds(dataset: AirfRANSGATrDataset, bounds: tuple, n_check: int 
               f"out-of-range points will be clamped to the grid edge by GridDecoder.")
 
 
-def compute_loss(pred: torch.Tensor, target: torch.Tensor) -> tuple:
+def compute_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    query_coords: torch.Tensor,
+    weights: torch.Tensor,
+    physics_weight: float,
+) -> tuple:
+    """Weighted per-channel MSE plus an optional incompressible-continuity
+    penalty. `query_coords` must be the same tensor passed as the model's
+    query_coords argument, with requires_grad_(True) set beforehand when
+    physics_weight > 0 — this lets us differentiate the predicted velocity
+    field w.r.t. position (via GridDecoder's differentiable interpolation)
+    and penalize d(v_x)/dx + d(v_y)/dy, the 2D incompressible mass-
+    conservation constraint. Real flows near the airfoil aren't purely
+    inviscid/incompressible (this is a RANS solve), so this is a soft prior
+    nudging the field towards physical coherence, not an exact constraint.
+    """
     per_channel = ((pred - target) ** 2).mean(dim=0)   # (3,): v_x, v_y, pressure
-    total = per_channel.mean()
-    return total, per_channel.detach()
+    total = (per_channel * weights).sum() / weights.sum()
+
+    physics_loss = pred.new_zeros(())
+    if physics_weight > 0:
+        dvx = torch.autograd.grad(
+            pred[:, 0].sum(), query_coords, create_graph=True, retain_graph=True
+        )[0]
+        dvy = torch.autograd.grad(
+            pred[:, 1].sum(), query_coords, create_graph=True, retain_graph=True
+        )[0]
+        continuity_residual = dvx[:, 0] + dvy[:, 1]   # d(v_x)/dx + d(v_y)/dy
+        physics_loss = (continuity_residual ** 2).mean()
+        total = total + physics_weight * physics_loss
+
+    return total, per_channel.detach(), physics_loss.detach()
 
 
-def run_epoch(model, loader, optimizer, device, epoch: int, train: bool):
+def run_epoch(model, loader, optimizer, device, epoch: int, train: bool,
+              loss_weights: torch.Tensor, physics_weight: float):
     model.train(train)
     total_loss = 0.0
     total_per_channel = torch.zeros(3)
+    total_physics_loss = 0.0
     n_samples = 0
 
     if train:
@@ -140,9 +194,14 @@ def run_epoch(model, loader, optimizer, device, epoch: int, train: bool):
         node_scalars = node_scalars.squeeze(0).to(device)
         target = target.squeeze(0).to(device)
 
-        with torch.set_grad_enabled(train):
-            pred = model(coords, node_scalars, coords)   # query at the same points used as input
-            loss, per_channel = compute_loss(pred, target)
+        with torch.set_grad_enabled(train or physics_weight > 0):
+            query_coords = coords
+            if physics_weight > 0:
+                query_coords = coords.clone().requires_grad_(True)
+            pred = model(coords, node_scalars, query_coords)   # query at the same points used as input
+            loss, per_channel, physics_loss = compute_loss(
+                pred, target, query_coords, loss_weights, physics_weight
+            )
 
         if train:
             (loss / GRAD_ACCUM_STEPS).backward()
@@ -153,6 +212,7 @@ def run_epoch(model, loader, optimizer, device, epoch: int, train: bool):
 
         total_loss += loss.item()
         total_per_channel += per_channel.cpu()
+        total_physics_loss += physics_loss.item()
         n_samples += 1
 
         pbar.set_postfix(loss=f"{total_loss / n_samples:.5f}")
@@ -162,7 +222,7 @@ def run_epoch(model, loader, optimizer, device, epoch: int, train: bool):
         optimizer.step()
         optimizer.zero_grad()
 
-    return total_loss / n_samples, total_per_channel / n_samples
+    return total_loss / n_samples, total_per_channel / n_samples, total_physics_loss / n_samples
 
 
 def main():
@@ -184,7 +244,7 @@ def main():
     val_loader = DataLoader(val_set, batch_size=1, shuffle=False)
 
     model = FlowFieldPipeline(
-        input_scalar_dim=5,
+        input_scalar_dim=6,
         mv_channels=MV_CHANNELS,
         scalar_channels=SCALAR_CHANNELS,
         n_heads=N_HEADS,
@@ -220,19 +280,27 @@ def main():
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     best_val_loss = float("inf")
     epochs_since_improvement = 0
+    loss_weights = torch.tensor(LOSS_WEIGHTS, device=device)
 
     for epoch in range(1, EPOCHS + 1):
-        train_loss, train_per_channel = run_epoch(model, train_loader, optimizer, device, epoch, train=True)
+        train_loss, train_per_channel, train_physics = run_epoch(
+            model, train_loader, optimizer, device, epoch, train=True,
+            loss_weights=loss_weights, physics_weight=PHYSICS_WEIGHT,
+        )
         scheduler.step()
 
         log = (f"Epoch {epoch:04d}  train_loss={train_loss:.5f} "
-               f"(v_x={train_per_channel[0]:.5f} v_y={train_per_channel[1]:.5f} p={train_per_channel[2]:.5f})  "
-               f"lr={scheduler.get_last_lr()[0]:.2e}")
+               f"(v_x={train_per_channel[0]:.5f} v_y={train_per_channel[1]:.5f} p={train_per_channel[2]:.5f} "
+               f"physics={train_physics:.5f})  lr={scheduler.get_last_lr()[0]:.2e}")
 
         if epoch % VAL_EVERY == 0:
-            val_loss, val_per_channel = run_epoch(model, val_loader, optimizer, device, epoch, train=False)
+            val_loss, val_per_channel, val_physics = run_epoch(
+                model, val_loader, optimizer, device, epoch, train=False,
+                loss_weights=loss_weights, physics_weight=PHYSICS_WEIGHT,
+            )
             log += (f"  val_loss={val_loss:.5f} "
-                    f"(v_x={val_per_channel[0]:.5f} v_y={val_per_channel[1]:.5f} p={val_per_channel[2]:.5f})")
+                    f"(v_x={val_per_channel[0]:.5f} v_y={val_per_channel[1]:.5f} p={val_per_channel[2]:.5f} "
+                    f"physics={val_physics:.5f})")
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
