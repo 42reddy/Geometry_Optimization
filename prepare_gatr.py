@@ -15,7 +15,7 @@ AIRFRANS_DIR = Path("data/airfrans")
 OUTPUT_DIR = Path("data/airfrans_gatr")
 N_SAMPLES = None  # None = all, or int for subset
 TARGET_POINTS = 9000  # downsample target
-BOUNDARY_RATIO = 0.80  # 80% of samples from boundary, 35% from field
+BOUNDARY_RATIO = 0.80  # 80% of samples from boundary, 20% from field
 VOXEL_PREFILTER_FACTOR = 3  # pre-filter boundary set to ~factor*n_boundary before FPS
 # ================
 

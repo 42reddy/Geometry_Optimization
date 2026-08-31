@@ -53,13 +53,15 @@ class FlowFieldPipeline(nn.Module):
         self.register_buffer('grid_coords', grid_coords)
         self.register_buffer('grid_mvs', encode_points_batch_torch(grid_coords))
 
-    def forward(self, coords: torch.Tensor, node_scalars: torch.Tensor, query_coords: torch.Tensor) -> torch.Tensor:
+    def encode_to_grid(self, coords: torch.Tensor, node_scalars: torch.Tensor) -> torch.Tensor:
         """
         coords       : (N, 2)  point-cloud coordinates for one sample
-        node_scalars : (N, input_scalar_dim)  freestream (broadcast), sdf, normals
-        query_coords : (Q, 2)  coordinates to evaluate the predicted field at
+        node_scalars : (N, input_scalar_dim)  freestream (broadcast), sdf, normals, log|V_inf|
 
-        Returns: (Q, n_outputs) predicted field at query_coords
+        Returns: (1, n_outputs, H, W) FNO's predicted field on the fixed grid — the
+        expensive GATr/GridProjector/FNO stages, decoupled from decode() so callers
+        that need multiple queries against the same field (e.g. a finite-difference
+        stencil for a physics loss) don't have to re-run them per query.
         """
         node_mvs = encode_points_batch_torch(coords)
         edge_index = build_knn_graph(coords, k=self.knn_k)
@@ -69,7 +71,25 @@ class FlowFieldPipeline(nn.Module):
         grid_mv_out, grid_s_out = self.grid_projector(point_mv, point_s, self.grid_mvs, bipartite_edges)
 
         grid_field = reshape_grid_features(grid_mv_out, grid_s_out, self.H, self.W).unsqueeze(0)   # (1, C, H, W)
-        fno_out = self.fno(grid_field)   # (1, n_outputs, H, W)
+        return self.fno(grid_field)   # (1, n_outputs, H, W)
 
+    def decode(self, fno_out: torch.Tensor, query_coords: torch.Tensor) -> torch.Tensor:
+        """
+        fno_out      : (1, n_outputs, H, W)  from encode_to_grid
+        query_coords : (Q, 2)  coordinates to evaluate the predicted field at
+
+        Returns: (Q, n_outputs) predicted field at query_coords
+        """
         pred = self.grid_decoder(fno_out, query_coords.unsqueeze(0))   # (1, Q, n_outputs)
         return pred.squeeze(0)
+
+    def forward(self, coords: torch.Tensor, node_scalars: torch.Tensor, query_coords: torch.Tensor) -> torch.Tensor:
+        """
+        coords       : (N, 2)  point-cloud coordinates for one sample
+        node_scalars : (N, input_scalar_dim)  freestream (broadcast), sdf, normals
+        query_coords : (Q, 2)  coordinates to evaluate the predicted field at
+
+        Returns: (Q, n_outputs) predicted field at query_coords
+        """
+        fno_out = self.encode_to_grid(coords, node_scalars)
+        return self.decode(fno_out, query_coords)

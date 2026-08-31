@@ -59,12 +59,22 @@ EARLY_STOP_PATIENCE = 20      # stop if val_loss hasn't improved in this many ep
 LOSS_WEIGHTS = (1.0, 2.0, 3.0)
 
 # Weight on the incompressible-continuity residual (d(v_x)/dx + d(v_y)/dy = 0
-# at each query point), computed via autograd through GridDecoder's
-# differentiable bilinear interpolation. This is a soft physical constraint,
-# not a replacement for the data loss — kept small so it regularizes the
-# field towards a coherent (divergence-free) flow instead of dominating the
-# fit to data. Set to 0.0 to disable.
+# at each query point). This is a soft physical constraint, not a replacement
+# for the data loss — kept small so it regularizes the field towards a
+# coherent (divergence-free) flow instead of dominating the fit to data.
+# Set to 0.0 to disable.
 PHYSICS_WEIGHT = 0.02
+# Finite-difference step (chord units) used to estimate the spatial
+# derivatives above. Computed via central differences on GridDecoder's
+# output rather than torch.autograd.grad, because create_graph=True through
+# F.grid_sample requires a double backward that PyTorch doesn't implement
+# for grid_sampler_2d. A plain finite difference only needs one ordinary
+# backward pass, and is cheap here since it reuses the same FNO grid output
+# (only the lightweight decode step is repeated, not GATr/FNO). Sized to
+# ~1/3 of a grid cell (grid spacing is ~0.0625-0.069 for the default
+# GRID_RESOLUTION/GRID_BOUNDS) so the stencil stays local to the bilinear
+# interpolant instead of spanning multiple cells.
+PHYSICS_EPS = 0.02
 
 MV_CHANNELS = 4
 SCALAR_CHANNELS = 8
@@ -140,43 +150,43 @@ def check_grid_bounds(dataset: AirfRANSGATrDataset, bounds: tuple, n_check: int 
               f"out-of-range points will be clamped to the grid edge by GridDecoder.")
 
 
+def continuity_residual_loss(model, fno_out: torch.Tensor, coords: torch.Tensor, eps: float) -> torch.Tensor:
+    """Central-difference estimate of d(v_x)/dx + d(v_y)/dy (2D incompressible
+    mass conservation) at each point, decoded from the already-computed FNO
+    grid field. Real flows near the airfoil aren't purely inviscid/
+    incompressible (this is a RANS solve), so this is a soft prior nudging
+    the field towards physical coherence, not an exact constraint.
+    """
+    ex = coords.new_tensor([eps, 0.0])
+    ey = coords.new_tensor([0.0, eps])
+
+    pred_xp = model.decode(fno_out, coords + ex)
+    pred_xm = model.decode(fno_out, coords - ex)
+    pred_yp = model.decode(fno_out, coords + ey)
+    pred_ym = model.decode(fno_out, coords - ey)
+
+    dvx_dx = (pred_xp[:, 0] - pred_xm[:, 0]) / (2 * eps)
+    dvy_dy = (pred_yp[:, 1] - pred_ym[:, 1]) / (2 * eps)
+    continuity_residual = dvx_dx + dvy_dy
+    return (continuity_residual ** 2).mean()
+
+
 def compute_loss(
     pred: torch.Tensor,
     target: torch.Tensor,
-    query_coords: torch.Tensor,
     weights: torch.Tensor,
+    physics_loss: torch.Tensor,
     physics_weight: float,
 ) -> tuple:
-    """Weighted per-channel MSE plus an optional incompressible-continuity
-    penalty. `query_coords` must be the same tensor passed as the model's
-    query_coords argument, with requires_grad_(True) set beforehand when
-    physics_weight > 0 — this lets us differentiate the predicted velocity
-    field w.r.t. position (via GridDecoder's differentiable interpolation)
-    and penalize d(v_x)/dx + d(v_y)/dy, the 2D incompressible mass-
-    conservation constraint. Real flows near the airfoil aren't purely
-    inviscid/incompressible (this is a RANS solve), so this is a soft prior
-    nudging the field towards physical coherence, not an exact constraint.
-    """
+    """Weighted per-channel MSE plus the (already-computed) physics penalty."""
     per_channel = ((pred - target) ** 2).mean(dim=0)   # (3,): v_x, v_y, pressure
     total = (per_channel * weights).sum() / weights.sum()
-
-    physics_loss = pred.new_zeros(())
-    if physics_weight > 0:
-        dvx = torch.autograd.grad(
-            pred[:, 0].sum(), query_coords, create_graph=True, retain_graph=True
-        )[0]
-        dvy = torch.autograd.grad(
-            pred[:, 1].sum(), query_coords, create_graph=True, retain_graph=True
-        )[0]
-        continuity_residual = dvx[:, 0] + dvy[:, 1]   # d(v_x)/dx + d(v_y)/dy
-        physics_loss = (continuity_residual ** 2).mean()
-        total = total + physics_weight * physics_loss
-
-    return total, per_channel.detach(), physics_loss.detach()
+    total = total + physics_weight * physics_loss
+    return total, per_channel.detach()
 
 
 def run_epoch(model, loader, optimizer, device, epoch: int, train: bool,
-              loss_weights: torch.Tensor, physics_weight: float):
+              loss_weights: torch.Tensor, physics_weight: float, physics_eps: float):
     model.train(train)
     total_loss = 0.0
     total_per_channel = torch.zeros(3)
@@ -194,14 +204,15 @@ def run_epoch(model, loader, optimizer, device, epoch: int, train: bool,
         node_scalars = node_scalars.squeeze(0).to(device)
         target = target.squeeze(0).to(device)
 
-        with torch.set_grad_enabled(train or physics_weight > 0):
-            query_coords = coords
+        with torch.set_grad_enabled(train):
+            fno_out = model.encode_to_grid(coords, node_scalars)
+            pred = model.decode(fno_out, coords)   # query at the same points used as input
+
+            physics_loss = pred.new_zeros(())
             if physics_weight > 0:
-                query_coords = coords.clone().requires_grad_(True)
-            pred = model(coords, node_scalars, query_coords)   # query at the same points used as input
-            loss, per_channel, physics_loss = compute_loss(
-                pred, target, query_coords, loss_weights, physics_weight
-            )
+                physics_loss = continuity_residual_loss(model, fno_out, coords, physics_eps)
+
+            loss, per_channel = compute_loss(pred, target, loss_weights, physics_loss, physics_weight)
 
         if train:
             (loss / GRAD_ACCUM_STEPS).backward()
@@ -285,7 +296,7 @@ def main():
     for epoch in range(1, EPOCHS + 1):
         train_loss, train_per_channel, train_physics = run_epoch(
             model, train_loader, optimizer, device, epoch, train=True,
-            loss_weights=loss_weights, physics_weight=PHYSICS_WEIGHT,
+            loss_weights=loss_weights, physics_weight=PHYSICS_WEIGHT, physics_eps=PHYSICS_EPS,
         )
         scheduler.step()
 
@@ -296,7 +307,7 @@ def main():
         if epoch % VAL_EVERY == 0:
             val_loss, val_per_channel, val_physics = run_epoch(
                 model, val_loader, optimizer, device, epoch, train=False,
-                loss_weights=loss_weights, physics_weight=PHYSICS_WEIGHT,
+                loss_weights=loss_weights, physics_weight=PHYSICS_WEIGHT, physics_eps=PHYSICS_EPS,
             )
             log += (f"  val_loss={val_loss:.5f} "
                     f"(v_x={val_per_channel[0]:.5f} v_y={val_per_channel[1]:.5f} p={val_per_channel[2]:.5f} "
