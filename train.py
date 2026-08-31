@@ -19,11 +19,17 @@ physical units — training itself operates entirely in nondimensional space,
 so samples with very different inlet speeds/Reynolds numbers contribute
 comparably to the loss instead of the fastest-flow samples dominating it).
 
-Training and validation loss are computed at the same points fed into the
-encoder (the downsampled point cloud) — GridDecoder's continuous
-interpolation means the trained model can equally be queried at any other
-coordinates (e.g. the full original mesh) at evaluation time, but that is
-not exercised here.
+Training and validation now run on the FULL ~180k-point mesh from
+sample_XXXXX/full.npz (also written by prepare_gatr.py), not the ~9k
+boundary-aware downsampled cloud in data.npz — see FULL_RESOLUTION below.
+full.npz has per-point coords/sdf/normals/velocity/pressure but not the two
+per-sample scalar features (freestream direction, log|V_inf|), which are
+still read from data.npz and broadcast the same way. This trains on the
+mesh's true point density directly (roughly half of which sits in the
+near-wall boundary layer — see grid_stretch.py) instead of on a downsampled
+approximation of it. It costs meaningfully more: GATr's k-NN graph attention
+scales with point count, so a full-res sample has ~20x the edges of the
+downsampled one.
 """
 
 import random
@@ -43,6 +49,11 @@ CHECKPOINT_DIR = Path("checkpoints")
 SEED = 0
 
 VAL_FRACTION = 0.1
+# Train on the full ~180k-point mesh (full.npz) instead of the ~9k
+# boundary-aware downsampled cloud (data.npz). Set False to fall back to the
+# downsampled cloud if the full-resolution point count is too much for
+# available GPU memory (GATr's k-NN attention scales with point count).
+FULL_RESOLUTION = True
 EPOCHS = 25
 LR = 3e-4
 WEIGHT_DECAY = 1e-5
@@ -114,25 +125,51 @@ def set_seed(seed: int) -> None:
 
 
 class AirfRANSGATrDataset(Dataset):
-    """Reads prepared per-sample NPZ files and assembles GATrEncoder's node_scalars."""
+    """Reads prepared per-sample NPZ files and assembles GATrEncoder's node_scalars.
 
-    def __init__(self, data_dir: Path):
+    full_res=True (default) reads the full ~180k-point mesh from full.npz
+    instead of the ~9k downsampled cloud in data.npz — data.npz is still
+    read for the two per-sample scalar features (freestream direction,
+    log|V_inf|) that aren't stored per-point in full.npz. Defaulting to True
+    here (rather than only in train.py's config) means eval.py's dataset
+    construction — which doesn't pass full_res explicitly — automatically
+    stays consistent with whatever train.py was actually trained on.
+    """
+
+    def __init__(self, data_dir: Path, full_res: bool = True):
         self.sample_dirs = sorted(d for d in data_dir.iterdir() if d.is_dir())
         if not self.sample_dirs:
             raise RuntimeError(f"No samples found in {data_dir} — run prepare_gatr.py first.")
+        self.full_res = full_res
+        if full_res and not (self.sample_dirs[0] / "full.npz").exists():
+            raise RuntimeError(
+                f"full_res=True but {self.sample_dirs[0]}/full.npz not found — "
+                f"rerun prepare_gatr.py (it now also saves the full-resolution mesh) "
+                f"or pass full_res=False to train on the downsampled cloud instead."
+            )
 
     def __len__(self) -> int:
         return len(self.sample_dirs)
 
     def __getitem__(self, idx: int):
-        data = np.load(self.sample_dirs[idx] / "full.npz")
-        coords = torch.from_numpy(data['coords']).float()
-        sdf = torch.from_numpy(data['sdf']).float()
-        normals = torch.from_numpy(data['normals']).float()
+        sample_dir = self.sample_dirs[idx]
+        data = np.load(sample_dir / "data.npz")
         freestream = torch.from_numpy(data['freestream']).float()
-        velocity = torch.from_numpy(data['velocity']).float()
-        pressure = torch.from_numpy(data['pressure']).float()
         log_v_inf = torch.tensor(float(data['log_v_inf']))
+
+        if self.full_res:
+            full = np.load(sample_dir / "full.npz")
+            coords = torch.from_numpy(full['coords']).float()
+            sdf = torch.from_numpy(full['sdf']).float()
+            normals = torch.from_numpy(full['normals']).float()
+            velocity = torch.from_numpy(full['velocity']).float()
+            pressure = torch.from_numpy(full['pressure']).float()
+        else:
+            coords = torch.from_numpy(data['coords']).float()
+            sdf = torch.from_numpy(data['sdf']).float()
+            normals = torch.from_numpy(data['normals']).float()
+            velocity = torch.from_numpy(data['velocity']).float()
+            pressure = torch.from_numpy(data['pressure']).float()
 
         n = coords.shape[0]
         freestream_bc = freestream.unsqueeze(0).expand(n, -1)   # broadcast to every node
@@ -251,7 +288,9 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    dataset = AirfRANSGATrDataset(DATA_DIR)
+    dataset = AirfRANSGATrDataset(DATA_DIR, full_res=FULL_RESOLUTION)
+    print(f"Training on {'FULL ~180k-point' if FULL_RESOLUTION else '~9k downsampled'} "
+          f"meshes per sample")
     check_grid_bounds(dataset, GRID_BOUNDS)
 
     n_val = max(1, int(len(dataset) * VAL_FRACTION))
