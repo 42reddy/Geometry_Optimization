@@ -1,11 +1,11 @@
 """
-Evaluate trained FlowFieldPipeline on the held-out AirfRANS validation split
-(the exact same split train.py produced, reconstructed here with the same
-SEED — evaluating on training samples would give falsely optimistic
-metrics).
+Evaluate trained GINOTModel on the held-out AirfRANS validation split (the
+exact same split train.py produced, reconstructed here with the same SEED —
+evaluating on training samples would give falsely optimistic metrics).
 
-The model both ENCODES and is DECODED at the downsampled ~9k point cloud
-from data.npz (prepare_gatr.py doesn't save a full-resolution mesh).
+The model ENCODES the airfoil surface point cloud (`surface_coords`) and is
+DECODED at the downsampled ~9k query-point cloud from data.npz
+(prepare_gatr.py doesn't save a full-resolution volume mesh).
 
 
 Two kinds of quantities are reported, and they are NOT interchangeable:
@@ -77,11 +77,11 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from train import (
-    AirfRANSGATrDataset, set_seed, SEED, VAL_FRACTION, CHECKPOINT_DIR, DATA_DIR,
-    GRID_BOUNDS, GRID_RESOLUTION, GRID_STRETCH_CENTER, GRID_STRETCH_GAMMA,
+    AirfRANSDataset, set_seed, SEED, VAL_FRACTION, CHECKPOINT_DIR, DATA_DIR,
+    EMBED_DIM, N_HEADS, N_SELF_ATTN_LAYERS, N_DECODER_LAYERS, N_CENTROIDS,
+    GROUP_RADIUS, GROUP_MAX_NEIGHBORS, PE_FREQS, CONDITION_HIDDEN, FFN_MULT,
 )
-from pipeline import FlowFieldPipeline
-from prepare_gatr import SDF_LOG_EPS
+from pipeline import GINOTModel
 
 # CONFIG
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -104,21 +104,18 @@ THRESHOLDS = {
 
 
 def load_model(checkpoint_path: Path) -> nn.Module:
-    model = FlowFieldPipeline(
-        input_scalar_dim=6,
-        mv_channels=8,
-        scalar_channels=12,
-        n_heads=4,
-        n_encoder_layers=8,
-        grid_resolution=GRID_RESOLUTION,
-        grid_bounds=GRID_BOUNDS,
-        grid_stretch_center=GRID_STRETCH_CENTER,
-        grid_stretch_gamma=GRID_STRETCH_GAMMA,
-        knn_k=16,
-        bipartite_k=8,
-        fno_hidden_channels=32,
-        fno_layers=4,
-        fno_modes=16,
+    model = GINOTModel(
+        embed_dim=EMBED_DIM,
+        n_heads=N_HEADS,
+        n_self_attn_layers=N_SELF_ATTN_LAYERS,
+        n_decoder_layers=N_DECODER_LAYERS,
+        n_centroids=N_CENTROIDS,
+        group_radius=GROUP_RADIUS,
+        group_max_neighbors=GROUP_MAX_NEIGHBORS,
+        pe_freqs=PE_FREQS,
+        condition_dim=3,
+        condition_hidden=CONDITION_HIDDEN,
+        ffn_mult=FFN_MULT,
         n_outputs=3,
     ).to(DEVICE)
 
@@ -512,7 +509,7 @@ def main():
     set_seed(SEED)
     print(f"Device: {DEVICE}\n")
 
-    dataset = AirfRANSGATrDataset(DATA_DIR)
+    dataset = AirfRANSDataset(DATA_DIR)
     n_val = max(1, int(len(dataset) * VAL_FRACTION))
     n_train = len(dataset) - n_val
     _, val_set = torch.utils.data.random_split(
@@ -532,26 +529,26 @@ def main():
 
     print(f"Evaluating {len(val_set)} samples...")
     with torch.no_grad():
-        for loop_i, (coords, node_scalars, target) in enumerate(val_loader):
+        for loop_i, (surface_coords, coords, condition, target) in enumerate(val_loader):
             global_idx = val_set.indices[loop_i]
             sample_dir = dataset.sample_dirs[global_idx]
 
+            surface_coords = surface_coords.squeeze(0).to(DEVICE)
             coords = coords.squeeze(0).to(DEVICE)
-            node_scalars = node_scalars.squeeze(0).to(DEVICE)
+            condition = condition.squeeze(0).to(DEVICE)
             target = target.squeeze(0).to(DEVICE)
 
-            fno_out = model.encode_to_grid(coords, node_scalars)
+            context = model.encode(surface_coords, condition)
 
             query_coords = coords
-            # node_scalars[:, 2] is sdf_log (see train.py) — invert
-            # encode_wall_normal's asinh stretch back to raw sdf for the
-            # physical sdf-banded diagnostics below.
-            sdf_log_np = node_scalars[:, 2].cpu().numpy()
-            sdf = np.sign(sdf_log_np) * np.sinh(np.abs(sdf_log_np)) * SDF_LOG_EPS
-            normals = node_scalars[:, 3:5].cpu().numpy()
+            # sdf/normals are diagnostics-only (GINOT takes no SDF/normals as
+            # model input) — read straight from the saved data.
+            data = np.load(sample_dir / "data.npz")
+            sdf = data['sdf']
+            normals = data['normals']
             target_np = target.cpu().numpy()
 
-            pred = model.decode(fno_out, query_coords)
+            pred = model.decode(context, query_coords)
 
             coords_np = query_coords.cpu().numpy()
             pred_np = pred.cpu().numpy()

@@ -1,31 +1,32 @@
 """
-Trains FlowFieldPipeline (GATr -> GridProjector -> FNO -> GridDecoder) on
-prepared AirfRANS samples from data/airfrans_gatr/.
+Trains GINOTModel (GeometryEncoder -> SolutionDecoder) on prepared AirfRANS
+samples from data/airfrans_gatr/.
 
 Sample schema (per sample_XXXXX/data.npz, written by prepare_gatr.py):
-    coords     (N, 2)  point coordinates, chord-normalized (chord = 1), raw
-    sdf        (N,)    signed distance to airfoil surface, raw
-    sdf_log    (N,)    sign(sdf) * asinh(|sdf| / eps) — wall-normal coordinate
-                        fed to the network instead of raw sdf: raw sdf
-                        compresses the whole boundary layer into a tiny
-                        numeric range near 0, while this stretches it (see
-                        encode_wall_normal in prepare_gatr.py).
-    normals    (N, 2)  unit surface normals, raw
-    freestream (2,)    inlet velocity, nondimensionalized: freestream / |V_inf|
-    velocity   (N, 2)  target velocity, nondimensionalized: velocity / |V_inf|
-    pressure   (N,)    target pressure, nondimensionalized: pressure / |V_inf|^2
-    log_v_inf  ()      log(|V_inf|) — the flow-speed magnitude that gets
-                        divided out of `freestream` above; kept as a separate
-                        scalar feature since the nondimensional flow shape
-                        still depends on it (through Reynolds number).
+    coords         (N, 2)  query-point coordinates, chord-normalized (chord = 1)
+    sdf            (N,)    signed distance to airfoil surface — kept for
+                            eval.py's physical diagnostics only; not a model
+                            input (GINOT captures geometry purely from
+                            surface_coords, no SDF needed)
+    normals        (N, 2)  unit surface normals — also diagnostics-only
+    freestream     (2,)    inlet velocity, nondimensionalized: freestream / |V_inf|
+    velocity       (N, 2)  target velocity, nondimensionalized: velocity / |V_inf|
+    pressure       (N,)    target pressure, nondimensionalized: pressure / |V_inf|^2
+    log_v_inf      ()      log(|V_inf|) — the flow-speed magnitude that gets
+                           divided out of `freestream` above; kept as a separate
+                           scalar feature since the nondimensional flow shape
+                           still depends on it (through Reynolds number).
+    surface_coords (S, 2)  full-resolution airfoil contour (sdf == 0), the
+                           geometry encoder's input.
+
 sample_XXXXX/stats.npz holds v_inf_mag, the freestream speed used for the
 nondimensionalization above (needed only to convert predictions back to
 physical units — training itself operates entirely in nondimensional space,
 so samples with very different inlet speeds/Reynolds numbers contribute
 comparably to the loss instead of the fastest-flow samples dominating it).
 
-Training and validation run on the ~9k-point boundary-aware downsampled
-cloud in data.npz (prepare_gatr.py doesn't save the full-resolution mesh).
+Training and validation query the ~9k-point boundary-aware downsampled cloud
+in data.npz (prepare_gatr.py doesn't save the full-resolution volume mesh).
 """
 
 import random
@@ -37,7 +38,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
-from pipeline import FlowFieldPipeline
+from pipeline import GINOTModel
 
 # ==== CONFIG ====
 DATA_DIR = Path("/kaggle/input/datasets/reddy42/gatr-aerfrans/airfrans_gatr")
@@ -67,42 +68,27 @@ LOSS_WEIGHTS = (1.0, 2.0, 3.0)
 # Set to 0.0 to disable.
 PHYSICS_WEIGHT = 0.02
 # Finite-difference step (chord units) used to estimate the spatial
-# derivatives above. Computed via central differences on GridDecoder's
-# output rather than torch.autograd.grad, because create_graph=True through
-# F.grid_sample requires a double backward that PyTorch doesn't implement
-# for grid_sampler_2d. A plain finite difference only needs one ordinary
-# backward pass, and is cheap here since it reuses the same FNO grid output
-# (only the lightweight decode step is repeated, not GATr/FNO). Sized to
-# ~1/3 of a grid cell (grid spacing is ~0.0625-0.069 for the default
-# GRID_RESOLUTION/GRID_BOUNDS) so the stencil stays local to the bilinear
-# interpolant instead of spanning multiple cells.
+# derivatives above. Computed via central differences on the decoder's
+# output rather than torch.autograd.grad, to avoid a double-backward
+# through attention; cheap since it reuses the same encoder context (only
+# the lightweight decode step is repeated, not the geometry encoder).
 PHYSICS_EPS = 0.02
 
-MV_CHANNELS = 8
-SCALAR_CHANNELS = 12
-N_HEADS = 4
-N_ENCODER_LAYERS = 8
-# Grid covers the observed coordinate range (x: [-2.16, 4.23], y: [-1.62, 1.62]
-# from a 20-sample check) with margin for the rest of the dataset.
-# Resolution bumped from (64, 128) now that the grid is stretched (below) —
-# a uniform grid this size has cells ~10x wider than the near-wall
-# boundary-layer band the full mesh concentrates points in, so no amount of
-# resolution alone (without stretching) would have fixed that; this increase
-# mainly buys sharper representation everywhere else now that near-wall
-# density is handled by the stretch. Raise further if GPU memory allows —
-# GridProjector's bipartite attention cost scales with H*W*bipartite_k.
-GRID_RESOLUTION = (192, 384)   # (H, W)
-GRID_BOUNDS = ((-3.0, 5.0), (-2.2, 2.2))   # ((x_min, x_max), (y_min, y_max))
-# Grid density is concentrated here (mid-chord, on the chord line) and falls
-# off towards the domain edges — see grid_stretch.py. GRID_STRETCH_GAMMA=0
-# recovers the old uniform grid.
-GRID_STRETCH_CENTER = (0.5, 0.0)
-GRID_STRETCH_GAMMA = 3.0
-KNN_K = 16
-BIPARTITE_K = 8
-FNO_HIDDEN_CHANNELS = 32
-FNO_LAYERS = 4
-FNO_MODES = 16
+# GINOT Architecture Config — Scaled Standard Configuration (Large)
+EMBED_DIM = 384
+N_HEADS = 6                   # Yields d_k = 64 per head (GPU-aligned)
+FFN_MULT = 4                  # d_ffn = 1536
+N_SELF_ATTN_LAYERS = 8        # Encoder self-attention depth
+N_DECODER_LAYERS = 4          # Decoder cross-attention depth
+
+# Spatial & Positional Encoding
+N_CENTROIDS = 512             # Increased spatial resolution over airfoil chord
+GROUP_RADIUS = 0.04           # Adjusted tighter for denser centroid sampling
+GROUP_MAX_NEIGHBORS = 64      # Neighbor support size
+PE_FREQS = 12                 # Frequency bands (yields 2 * 12 * 2 = 48 positional dims for 2D coords)
+
+# Conditioning Sub-network
+CONDITION_HIDDEN = 192        # Set to EMBED_DIM // 2 for balanced parameter modulation
 
 VAL_EVERY = 1
 # ================
@@ -115,9 +101,10 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-class AirfRANSGATrDataset(Dataset):
+class AirfRANSDataset(Dataset):
     """Reads prepared per-sample NPZ files (data.npz, written by
-    prepare_gatr.py) and assembles GATrEncoder's node_scalars."""
+    prepare_gatr.py): the airfoil surface cloud (geometry encoder input),
+    the per-sample scalar condition, and the query points/targets."""
 
     def __init__(self, data_dir: Path):
         self.sample_dirs = sorted(d for d in data_dir.iterdir() if d.is_dir())
@@ -130,55 +117,34 @@ class AirfRANSGATrDataset(Dataset):
     def __getitem__(self, idx: int):
         sample_dir = self.sample_dirs[idx]
         data = np.load(sample_dir / "data.npz")
+
+        surface_coords = torch.from_numpy(data['surface_coords']).float()
         freestream = torch.from_numpy(data['freestream']).float()
         log_v_inf = torch.tensor(float(data['log_v_inf']))
+        condition = torch.cat([freestream, log_v_inf.unsqueeze(0)])   # (3,)
 
         coords = torch.from_numpy(data['coords']).float()
-        sdf_log = torch.from_numpy(data['sdf_log']).float()
-        normals = torch.from_numpy(data['normals']).float()
         velocity = torch.from_numpy(data['velocity']).float()
         pressure = torch.from_numpy(data['pressure']).float()
+        target = torch.cat([velocity, pressure.unsqueeze(-1)], dim=-1)   # (N, 3)
 
-        n = coords.shape[0]
-        freestream_bc = freestream.unsqueeze(0).expand(n, -1)   # broadcast to every node
-        log_v_inf_bc = log_v_inf.expand(n).unsqueeze(-1)        # broadcast to every node
-        node_scalars = torch.cat(
-            [freestream_bc, sdf_log.unsqueeze(-1), normals, log_v_inf_bc], dim=-1
-        )   # (N, 6)
-        target = torch.cat([velocity, pressure.unsqueeze(-1)], dim=-1)                   # (N, 3)
-
-        return coords, node_scalars, target
+        return surface_coords, coords, condition, target
 
 
-def check_grid_bounds(dataset: AirfRANSGATrDataset, bounds: tuple, n_check: int = 20) -> None:
-    (x_min, x_max), (y_min, y_max) = bounds
-    xs, ys = [], []
-    for i in range(min(n_check, len(dataset))):
-        coords, _, _ = dataset[i]
-        xs.append(coords[:, 0])
-        ys.append(coords[:, 1])
-    xs, ys = torch.cat(xs), torch.cat(ys)
-    obs_x, obs_y = (xs.min().item(), xs.max().item()), (ys.min().item(), ys.max().item())
-    print(f"Observed coordinate range (from {n_check} samples): x={obs_x}, y={obs_y}")
-    if obs_x[0] < x_min or obs_x[1] > x_max or obs_y[0] < y_min or obs_y[1] > y_max:
-        print(f"WARNING: GRID_BOUNDS {bounds} do not cover the observed coordinate range — "
-              f"out-of-range points will be clamped to the grid edge by GridDecoder.")
-
-
-def continuity_residual_loss(model, fno_out: torch.Tensor, coords: torch.Tensor, eps: float) -> torch.Tensor:
+def continuity_residual_loss(model, context: torch.Tensor, coords: torch.Tensor, eps: float) -> torch.Tensor:
     """Central-difference estimate of d(v_x)/dx + d(v_y)/dy (2D incompressible
-    mass conservation) at each point, decoded from the already-computed FNO
-    grid field. Real flows near the airfoil aren't purely inviscid/
+    mass conservation) at each point, decoded from the already-computed
+    encoder context. Real flows near the airfoil aren't purely inviscid/
     incompressible (this is a RANS solve), so this is a soft prior nudging
     the field towards physical coherence, not an exact constraint.
     """
     ex = coords.new_tensor([eps, 0.0])
     ey = coords.new_tensor([0.0, eps])
 
-    pred_xp = model.decode(fno_out, coords + ex)
-    pred_xm = model.decode(fno_out, coords - ex)
-    pred_yp = model.decode(fno_out, coords + ey)
-    pred_ym = model.decode(fno_out, coords - ey)
+    pred_xp = model.decode(context, coords + ex)
+    pred_xm = model.decode(context, coords - ex)
+    pred_yp = model.decode(context, coords + ey)
+    pred_ym = model.decode(context, coords - ey)
 
     dvx_dx = (pred_xp[:, 0] - pred_xm[:, 0]) / (2 * eps)
     dvy_dy = (pred_yp[:, 1] - pred_ym[:, 1]) / (2 * eps)
@@ -214,18 +180,19 @@ def run_epoch(model, loader, optimizer, device, epoch: int, train: bool,
     phase = "train" if train else "val"
     pbar = tqdm(loader, desc=f"Epoch {epoch:04d} [{phase}]", leave=False, unit="sample")
 
-    for step, (coords, node_scalars, target) in enumerate(pbar):
+    for step, (surface_coords, coords, condition, target) in enumerate(pbar):
+        surface_coords = surface_coords.squeeze(0).to(device)
         coords = coords.squeeze(0).to(device)
-        node_scalars = node_scalars.squeeze(0).to(device)
+        condition = condition.squeeze(0).to(device)
         target = target.squeeze(0).to(device)
 
         with torch.set_grad_enabled(train):
-            fno_out = model.encode_to_grid(coords, node_scalars)
-            pred = model.decode(fno_out, coords)   # query at the same points used as input
+            context = model.encode(surface_coords, condition)
+            pred = model.decode(context, coords)   # query at the same points used as input
 
             physics_loss = pred.new_zeros(())
             if physics_weight > 0:
-                physics_loss = continuity_residual_loss(model, fno_out, coords, physics_eps)
+                physics_loss = continuity_residual_loss(model, context, coords, physics_eps)
 
             loss, per_channel = compute_loss(pred, target, loss_weights, physics_loss, physics_weight)
 
@@ -256,9 +223,8 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    dataset = AirfRANSGATrDataset(DATA_DIR)
-    print(f"Training on ~9k downsampled meshes per sample")
-    check_grid_bounds(dataset, GRID_BOUNDS)
+    dataset = AirfRANSDataset(DATA_DIR)
+    print(f"Training on ~9k downsampled query points per sample")
 
     n_val = max(1, int(len(dataset) * VAL_FRACTION))
     n_train = len(dataset) - n_val
@@ -270,21 +236,18 @@ def main():
     train_loader = DataLoader(train_set, batch_size=1, shuffle=True)
     val_loader = DataLoader(val_set, batch_size=1, shuffle=False)
 
-    model = FlowFieldPipeline(
-        input_scalar_dim=6,
-        mv_channels=MV_CHANNELS,
-        scalar_channels=SCALAR_CHANNELS,
+    model = GINOTModel(
+        embed_dim=EMBED_DIM,
         n_heads=N_HEADS,
-        n_encoder_layers=N_ENCODER_LAYERS,
-        grid_resolution=GRID_RESOLUTION,
-        grid_bounds=GRID_BOUNDS,
-        grid_stretch_center=GRID_STRETCH_CENTER,
-        grid_stretch_gamma=GRID_STRETCH_GAMMA,
-        knn_k=KNN_K,
-        bipartite_k=BIPARTITE_K,
-        fno_hidden_channels=FNO_HIDDEN_CHANNELS,
-        fno_layers=FNO_LAYERS,
-        fno_modes=FNO_MODES,
+        n_self_attn_layers=N_SELF_ATTN_LAYERS,
+        n_decoder_layers=N_DECODER_LAYERS,
+        n_centroids=N_CENTROIDS,
+        group_radius=GROUP_RADIUS,
+        group_max_neighbors=GROUP_MAX_NEIGHBORS,
+        pe_freqs=PE_FREQS,
+        condition_dim=3,
+        condition_hidden=CONDITION_HIDDEN,
+        ffn_mult=FFN_MULT,
         n_outputs=3,
     ).to(device)
 
@@ -293,9 +256,9 @@ def main():
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 
-    # Linear warmup (stabilizes early training, when GATr/FNO weights are still
-    # near their random init and large steps can destabilize the FFT-based
-    # spectral layers) followed by cosine decay to zero over the remaining epochs.
+    # Linear warmup (stabilizes early training, when attention weights are
+    # still near their random init and large steps can destabilize training)
+    # followed by cosine decay to zero over the remaining epochs.
     warmup = torch.optim.lr_scheduler.LinearLR(
         optimizer, start_factor=0.1, total_iters=WARMUP_EPOCHS
     )

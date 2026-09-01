@@ -1,102 +1,78 @@
 """
 Assembles the full point-cloud -> flow-field model:
 
-  point cloud --[GATrEncoder]--> per-node features
-              --[GridProjector]--> structured grid
-              --[FNO2d]--> predicted field on the grid
-              --[GridDecoder]--> predictions at arbitrary query coordinates
+  surface point cloud + condition --[GeometryEncoder]--> context tokens
+  query coordinates + context     --[SolutionDecoder]--> predicted field
+
+See ginot.py for the GINOT architecture itself.
 """
 
-import torch
 import torch.nn as nn
 
-from GATr import GATrModel
-from grid_projection import GridProjector, GridDecoder, reshape_grid_features
-from fno import FNO2d
-from graph_utils import build_knn_graph, build_bipartite_knn, build_structured_grid
-from GA_encoder import encode_points_batch_torch
+from ginot import GeometryEncoder, SolutionDecoder
 
 
-class FlowFieldPipeline(nn.Module):
+class GINOTModel(nn.Module):
 
     def __init__(
         self,
-        input_scalar_dim: int = 5,
-        mv_channels: int = 4,
-        scalar_channels: int = 8,
-        n_heads: int = 2,
-        n_encoder_layers: int = 4,
-        grid_resolution: tuple = (64, 64),
-        grid_bounds: tuple = ((-3.0, 3.0), (-3.0, 3.0)),
-        grid_stretch_center: tuple = (0.5, 0.0),
-        grid_stretch_gamma: float = 3.0,
-        knn_k: int = 16,
-        bipartite_k: int = 8,
-        fno_hidden_channels: int = 32,
-        fno_layers: int = 4,
-        fno_modes: int = 16,
+        embed_dim: int = 128,
+        n_heads: int = 4,
+        n_self_attn_layers: int = 3,
+        n_decoder_layers: int = 2,
+        n_centroids: int = 256,
+        group_radius: float = 0.05,
+        group_max_neighbors: int = 32,
+        pe_freqs: int = 10,
+        condition_dim: int = 3,
+        condition_hidden: int = 64,
+        ffn_mult: int = 4,
         n_outputs: int = 3,
     ):
         super().__init__()
-        self.knn_k = knn_k
-        self.bipartite_k = bipartite_k
-        self.grid_bounds = grid_bounds
-
-        self.gatr = GATrModel(input_scalar_dim, mv_channels, scalar_channels, n_heads, n_encoder_layers)
-        self.grid_projector = GridProjector(mv_channels, scalar_channels, n_heads)
-
-        fno_in_channels = mv_channels * 16 + scalar_channels
-        self.fno = FNO2d(fno_in_channels, fno_hidden_channels, n_outputs,
-                          fno_layers, fno_modes, fno_modes)
-
-        grid_coords, self.H, self.W = build_structured_grid(
-            grid_bounds, grid_resolution, grid_stretch_center, grid_stretch_gamma
+        self.geometry_encoder = GeometryEncoder(
+            embed_dim=embed_dim,
+            n_heads=n_heads,
+            n_self_attn_layers=n_self_attn_layers,
+            n_centroids=n_centroids,
+            group_radius=group_radius,
+            group_max_neighbors=group_max_neighbors,
+            pe_freqs=pe_freqs,
+            condition_dim=condition_dim,
+            condition_hidden=condition_hidden,
+            ffn_mult=ffn_mult,
         )
-        # GridDecoder needs the SAME actual (H, W) build_structured_grid ended up
-        # with (rounding in the stretch split can shift it a few cells from the
-        # requested resolution) so its inverse mapping lands on the same lattice.
-        self.grid_decoder = GridDecoder(grid_bounds, (self.H, self.W), grid_stretch_center, grid_stretch_gamma)
+        self.decoder = SolutionDecoder(
+            embed_dim=embed_dim,
+            n_heads=n_heads,
+            n_layers=n_decoder_layers,
+            pe_freqs=pe_freqs,
+            n_outputs=n_outputs,
+            ffn_mult=ffn_mult,
+        )
 
-        self.register_buffer('grid_coords', grid_coords)
-        self.register_buffer('grid_mvs', encode_points_batch_torch(grid_coords))
-
-    def encode_to_grid(self, coords: torch.Tensor, node_scalars: torch.Tensor) -> torch.Tensor:
+    def encode(self, surface_coords, condition):
         """
-        coords       : (N, 2)  point-cloud coordinates for one sample
-        node_scalars : (N, input_scalar_dim)  freestream (broadcast), sdf, normals, log|V_inf|
+        surface_coords : (S, 2)  airfoil boundary point cloud
+        condition      : (condition_dim,)  per-sample scalar condition
+                          (freestream direction, log flow speed)
 
-        Returns: (1, n_outputs, H, W) FNO's predicted field on the fixed grid — the
-        expensive GATr/GridProjector/FNO stages, decoupled from decode() so callers
-        that need multiple queries against the same field (e.g. a finite-difference
-        stencil for a physics loss) don't have to re-run them per query.
+        Returns: context tokens (1, n_centroids + 1, embed_dim) — decoupled
+        from decode() so callers that need multiple queries against the same
+        geometry (e.g. a finite-difference stencil for a physics loss)
+        don't have to re-run the (more expensive) encoder per query.
         """
-        node_mvs = encode_points_batch_torch(coords)
-        edge_index = build_knn_graph(coords, k=self.knn_k)
-        point_mv, point_s = self.gatr(node_mvs, node_scalars, edge_index)
+        return self.geometry_encoder(surface_coords, condition)
 
-        bipartite_edges = build_bipartite_knn(coords, self.grid_coords, k=self.bipartite_k)
-        grid_mv_out, grid_s_out = self.grid_projector(point_mv, point_s, self.grid_mvs, bipartite_edges)
-
-        grid_field = reshape_grid_features(grid_mv_out, grid_s_out, self.H, self.W).unsqueeze(0)   # (1, C, H, W)
-        return self.fno(grid_field)   # (1, n_outputs, H, W)
-
-    def decode(self, fno_out: torch.Tensor, query_coords: torch.Tensor) -> torch.Tensor:
+    def decode(self, context, query_coords):
         """
-        fno_out      : (1, n_outputs, H, W)  from encode_to_grid
+        context      : (1, n_centroids + 1, embed_dim)  from encode()
         query_coords : (Q, 2)  coordinates to evaluate the predicted field at
 
         Returns: (Q, n_outputs) predicted field at query_coords
         """
-        pred = self.grid_decoder(fno_out, query_coords.unsqueeze(0))   # (1, Q, n_outputs)
-        return pred.squeeze(0)
+        return self.decoder(query_coords, context)
 
-    def forward(self, coords: torch.Tensor, node_scalars: torch.Tensor, query_coords: torch.Tensor) -> torch.Tensor:
-        """
-        coords       : (N, 2)  point-cloud coordinates for one sample
-        node_scalars : (N, input_scalar_dim)  freestream (broadcast), sdf, normals
-        query_coords : (Q, 2)  coordinates to evaluate the predicted field at
-
-        Returns: (Q, n_outputs) predicted field at query_coords
-        """
-        fno_out = self.encode_to_grid(coords, node_scalars)
-        return self.decode(fno_out, query_coords)
+    def forward(self, surface_coords, condition, query_coords):
+        context = self.encode(surface_coords, condition)
+        return self.decode(context, query_coords)

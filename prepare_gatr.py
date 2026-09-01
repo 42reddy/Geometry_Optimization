@@ -1,9 +1,10 @@
 """
-Prepare AirfRANS data for GATr encoding:
-1. Intelligently downsample point clouds (180k → ~9k)
-2. Preserve boundary geometry (airfoil)
-3. Nondimensionalize fields by freestream speed
-4. Save in GATr-compatible format
+Prepare AirfRANS data for GINOT encoding:
+1. Extract the full-resolution airfoil surface contour (geometry encoder input)
+2. Intelligently downsample the volume point cloud (180k → ~9k) as query/target points
+3. Preserve boundary geometry (airfoil)
+4. Nondimensionalize fields by freestream speed
+5. Save in GINOT-compatible format
 """
 
 from pathlib import Path
@@ -30,24 +31,7 @@ SDF_BIN_EDGES = (0.0, 1e-4, 1e-3, 1e-2, 0.05, 0.1, 0.5, np.inf)
 # where velocity/pressure gradients are steepest.
 NEAR_WALL_BOOST = 1.3
 NEAR_WALL_BOOST_CUTOFF = 0.01
-
-# Wall-normal coordinate encoding: raw (signed) sdf compresses the entire
-# boundary layer into a tiny numeric range near 0, so the network gets
-# almost no resolution exactly where gradients are sharpest. Instead encode
-# sign(sdf) * asinh(|sdf| / SDF_LOG_EPS): near 0 this is ~linear with slope
-# 1/SDF_LOG_EPS (i.e. it *stretches* the near-wall region), and for
-# |sdf| >> SDF_LOG_EPS it asymptotes to sign(sdf) * log(2|sdf|/SDF_LOG_EPS)
-# (compressing the far-field the way plain log(sdf) would) — the same
-# sinh-stretching trick used for near-wall mesh clustering in CFD, adapted
-# here as a feature transform instead of a grid spacing rule. SDF_LOG_EPS is
-# set to the viscous-sublayer scale (chord-normalized).
-SDF_LOG_EPS = 1e-3
 # ================
-
-
-def encode_wall_normal(sdf: np.ndarray, eps: float = SDF_LOG_EPS) -> np.ndarray:
-    """Signed asinh-stretched sdf — see SDF_LOG_EPS above."""
-    return (np.sign(sdf) * np.arcsinh(np.abs(sdf) / eps)).astype(np.float32)
 
 
 def load_airfrans_sample(dataset, idx: int):
@@ -276,15 +260,16 @@ def save_sample(
     velocity: np.ndarray,
     pressure: np.ndarray,
     stats: dict,
+    surface_coords: np.ndarray,
 ) -> None:
-    """Save the downsampled sample in NPZ format, including `sdf_log` — the
-    asinh-stretched wall-normal coordinate (see encode_wall_normal), which is
-    the feature intended for the network's geometric input — alongside raw
-    `sdf`, kept for physical diagnostics (e.g. eval.py's sdf-banded metrics)."""
+    """Save the downsampled sample in NPZ format. `surface_coords` is the
+    full-resolution airfoil contour (GINOT's geometry encoder input); `sdf`
+    stays only for physical diagnostics (e.g. eval.py's sdf-banded metrics),
+    since GINOT needs no SDF/normals as model input."""
     sample_dir = output_dir / f"sample_{idx:05d}"
     sample_dir.mkdir(exist_ok=True)
 
-    # log(|V_inf|) as an extra broadcast scalar feature: `freestream` above is
+    # log(|V_inf|) as an extra scalar condition feature: `freestream` above is
     # already divided by |V_inf|, so it only carries the AoA direction — the
     # flow *speed* (and therefore Reynolds number, since AirfRANS varies
     # viscosity much less than inlet speed) would otherwise never reach the
@@ -298,12 +283,12 @@ def save_sample(
         sample_dir / "data.npz",
         coords=coords,
         sdf=sdf,
-        sdf_log=encode_wall_normal(sdf),
         normals=normals,
         freestream=freestream,
         velocity=velocity,
         pressure=pressure,
         log_v_inf=log_v_inf,
+        surface_coords=surface_coords,
     )
 
     # Save stats as NPZ (needed to denormalize predictions back to physical units)
@@ -316,14 +301,14 @@ def prepare_dataset(
     n_samples: int = None,
     target_points: int = 9000
 ) -> None:
-    """Process entire dataset for GATr."""
+    """Process entire dataset for GINOT."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
     dataset_size = len(airfrans_dataset)
     if n_samples is not None:
         dataset_size = min(n_samples, dataset_size)
 
-    print(f"\nPreparing {dataset_size} samples for GATr")
+    print(f"\nPreparing {dataset_size} samples for GINOT")
     print(f"Target: {target_points} points per sample")
     print(f"SDF bin edges: {SDF_BIN_EDGES}")
 
@@ -337,6 +322,9 @@ def prepare_dataset(
         coords, sdf, normals, freestream, velocity, pressure = load_airfrans_sample(
             airfrans_dataset, idx
         )
+        # Full-resolution airfoil contour — GINOT's geometry encoder input.
+        # Surface mesh nodes have sdf exactly 0 (they sit on the body).
+        surface_coords = coords[sdf == 0]
 
         normalized_full, stats = nondimensionalize(freestream, velocity, pressure)
 
@@ -355,7 +343,8 @@ def prepare_dataset(
             normalized_full['freestream'],
             vel_down,
             press_down,
-            stats
+            stats,
+            surface_coords,
         )
 
         # Track statistics (convert numpy types to Python native for JSON serialization)
@@ -392,7 +381,6 @@ def prepare_dataset(
         'sdf_bin_edges': [None if e == np.inf else e for e in SDF_BIN_EDGES],
         'near_wall_boost': NEAR_WALL_BOOST,
         'near_wall_boost_cutoff': NEAR_WALL_BOOST_CUTOFF,
-        'sdf_log_eps': SDF_LOG_EPS,
         'sample_stats': stats_all
     }
 
@@ -413,11 +401,11 @@ def main():
     dataset = AirfRANS(root=str(AIRFRANS_DIR), task="full", train=True)
     print(f"✓ Loaded {len(dataset)} samples")
 
-    # Prepare for GATr
+    # Prepare for GINOT
     prepare_dataset(dataset, OUTPUT_DIR, N_SAMPLES, TARGET_POINTS)
 
     print(f"\n✓ Data saved to {OUTPUT_DIR}/")
-    print(f"  Ready for GATr encoding!")
+    print(f"  Ready for GINOT encoding!")
 
 
 if __name__ == "__main__":
