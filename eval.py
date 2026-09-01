@@ -89,6 +89,7 @@ from torch.utils.data import DataLoader
 from train import (
     AirfRANSGATrDataset, set_seed, SEED, VAL_FRACTION, CHECKPOINT_DIR, DATA_DIR,
     GRID_BOUNDS, GRID_RESOLUTION, GRID_STRETCH_CENTER, GRID_STRETCH_GAMMA,
+    USE_NEAR_WALL_CORRECTION, NEAR_WALL_K, NEAR_WALL_HIDDEN, NEAR_WALL_WALL_SCALE,
 )
 from pipeline import FlowFieldPipeline
 
@@ -114,7 +115,7 @@ THRESHOLDS = {
 
 def load_model(checkpoint_path: Path) -> nn.Module:
     model = FlowFieldPipeline(
-        input_scalar_dim=6,
+        input_scalar_dim=7,
         mv_channels=4,
         scalar_channels=8,
         n_heads=2,
@@ -129,6 +130,10 @@ def load_model(checkpoint_path: Path) -> nn.Module:
         fno_layers=4,
         fno_modes=16,
         n_outputs=3,
+        use_near_wall_correction=USE_NEAR_WALL_CORRECTION,
+        near_wall_k=NEAR_WALL_K,
+        near_wall_hidden=NEAR_WALL_HIDDEN,
+        near_wall_wall_scale=NEAR_WALL_WALL_SCALE,
     ).to(DEVICE)
 
     model.load_state_dict(torch.load(checkpoint_path, map_location=DEVICE, weights_only=True))
@@ -558,7 +563,7 @@ def main():
             node_scalars = node_scalars.squeeze(0).to(DEVICE)
             target = target.squeeze(0).to(DEVICE)
 
-            fno_out = model.encode_to_grid(coords, node_scalars)
+            fno_out, point_ctx = model.encode_to_grid(coords, node_scalars)
 
             if full_res_available:
                 full = np.load(sample_dir / "full.npz")
@@ -568,13 +573,16 @@ def main():
                 target_np = np.concatenate(
                     [full['velocity'], full['pressure'][:, None]], axis=-1
                 )
+                query_sdf = torch.from_numpy(sdf).float().to(DEVICE)
             else:
                 query_coords = coords
                 sdf = node_scalars[:, 2].cpu().numpy()
-                normals = node_scalars[:, 3:5].cpu().numpy()
+                # column layout: [freestream_x, freestream_y, sdf, log_sdf, normal_x, normal_y, log_v_inf]
+                normals = node_scalars[:, 4:6].cpu().numpy()
                 target_np = target.cpu().numpy()
+                query_sdf = node_scalars[:, 2]
 
-            pred = model.decode(fno_out, query_coords)
+            pred = model.decode(fno_out, query_coords, point_ctx=point_ctx, query_sdf=query_sdf)
 
             coords_np = query_coords.cpu().numpy()
             pred_np = pred.cpu().numpy()

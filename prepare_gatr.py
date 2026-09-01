@@ -15,8 +15,28 @@ AIRFRANS_DIR = Path("data/airfrans")
 OUTPUT_DIR = Path("data/airfrans_gatr")
 N_SAMPLES = None  # None = all, or int for subset
 TARGET_POINTS = 9000  # downsample target
-BOUNDARY_RATIO = 0.80  # 80% of samples from boundary, 20% from field
-VOXEL_PREFILTER_FACTOR = 3  # pre-filter boundary set to ~factor*n_boundary before FPS
+VOXEL_PREFILTER_FACTOR = 3  # pre-filter each bin to ~factor*n_bin before FPS
+
+# Log-spaced |sdf| bin edges (chord units) used to STRATIFY the downsample
+# explicitly, replacing the old "80% from a loose |sdf|<0.5 boundary blob"
+# heuristic. That heuristic ran farthest-point sampling over the whole
+# boundary blob, which maximizes spatial COVERAGE, not density -- so it
+# spread the budget roughly evenly across |sdf|<0.5 and ended up putting
+# only ~2% of the 9k budget inside |sdf|<0.01, even though that thin
+# viscous-sublayer shell holds ~47% of the true ~180k-point mesh (RANS
+# solvers cluster cells there to resolve the boundary layer). Any point
+# never seen at training density can't be learned, no matter how the loss
+# is weighted. Binning geometrically (not linearly) matches how the mesh
+# itself refines -- each bin roughly halves/doubles distance from the wall.
+SDF_BIN_EDGES = (0.0, 0.0025, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, float('inf'))
+# Combined floor on the fraction of target_points spent inside |sdf|<0.01,
+# applied ON TOP OF that band's own true-mesh fraction -- "match or exceed"
+# the true near-wall density, since the steep gradients there benefit from
+# more than a naive count-proportional share.
+NEAR_WALL_FLOOR_FRACTION = 0.30
+# Bins fully beyond this |sdf| are cheap uniform random instead of FPS --
+# that part of the flow is smooth and doesn't need exact spatial coverage.
+FPS_SDF_CUTOFF = 0.5
 # ================
 
 
@@ -42,14 +62,25 @@ def load_airfrans_sample(dataset, idx: int):
     return coords, sdf, normals, freestream, velocity, pressure
 
 
-def voxel_prefilter(coords: np.ndarray, max_points: int) -> np.ndarray:
+def voxel_prefilter(coords: np.ndarray, max_points: int, iters: int = 20) -> np.ndarray:
     """
     Fast vectorized pre-filter: bin points into a 2D grid sized to yield
     roughly `max_points` occupied cells, keep one point per cell.
 
-    This is O(n) (no Python-level distance loop) and is used to shrink a
-    large point set before running the O(n*k) farthest point sampling, so
-    FPS only ever runs on a small, already-well-spread subset.
+    Cell size is found by binary search on the ACHIEVED occupied-cell count
+    rather than a bounding-box-area formula (area / max_points). The area
+    formula assumes points fill the 2D box uniformly; it badly under-counts
+    when points are confined to a thin curve/manifold inside that box --
+    e.g. points right at the airfoil surface live on a ~1D curve, so a
+    handful of cells covering the curve's bounding box are almost all
+    empty, and the naive formula returns far fewer occupied cells than
+    requested (observed: ~700 instead of ~9800 for a near-wall bin). Search
+    is data-driven, so it self-corrects regardless of whether the bin's
+    points fill an area or hug a curve.
+
+    This is O(n) per probe (no Python-level distance loop) and is used to
+    shrink a large point set before running the O(n*k) farthest point
+    sampling, so FPS only ever runs on a small, already-well-spread subset.
     """
     n = coords.shape[0]
     if n <= max_points:
@@ -58,79 +89,130 @@ def voxel_prefilter(coords: np.ndarray, max_points: int) -> np.ndarray:
     mins = coords.min(axis=0)
     maxs = coords.max(axis=0)
     extent = np.maximum(maxs - mins, 1e-9)
-    area = extent[0] * extent[1]
-    cell_size = np.sqrt(area / max_points)
-    cell_size = max(cell_size, 1e-9)
 
-    grid_idx = np.floor((coords - mins) / cell_size).astype(np.int64)
-    # Combine (row, col) grid indices into a single hashable key per point
-    keys = grid_idx[:, 0] * 1_000_003 + grid_idx[:, 1]
-    _, unique_pos = np.unique(keys, return_index=True)
-    return unique_pos
+    def occupied(cell_size: float) -> np.ndarray:
+        grid_idx = np.floor((coords - mins) / cell_size).astype(np.int64)
+        keys = grid_idx[:, 0] * 1_000_003 + grid_idx[:, 1]
+        _, unique_pos = np.unique(keys, return_index=True)
+        return unique_pos
+
+    cell_lo = float(extent.min()) * 1e-6   # fine enough that occupied(cell_lo) ~= n
+    cell_hi = float(extent.max())          # coarse enough that occupied(cell_hi) ~= 1
+
+    best = occupied(cell_lo)
+    if len(best) <= max_points:
+        return best   # even the finest cell size can't reach max_points (near-duplicate coords)
+
+    # Binary search for the LARGEST cell_size that still yields >= max_points
+    # occupied cells (largest -> closest to max_points from above, keeping
+    # the candidate set small for the FPS step that follows).
+    lo, hi = cell_lo, cell_hi
+    for _ in range(iters):
+        mid = 0.5 * (lo + hi)
+        occ = occupied(mid)
+        if len(occ) >= max_points:
+            lo, best = mid, occ
+        else:
+            hi = mid
+    return best
 
 
-def boundary_aware_downsample(
+def compute_bin_budget(
+    abs_sdf: np.ndarray,
+    target_points: int,
+    bin_edges=SDF_BIN_EDGES,
+    near_wall_floor_fraction: float = NEAR_WALL_FLOOR_FRACTION,
+):
+    """
+    Per-sample point budget for each |sdf| bin: proportional to that bin's
+    TRUE share of the full mesh's points, then topped up so bins fully
+    inside |sdf|<0.01 collectively get at least `near_wall_floor_fraction`
+    of target_points (pulled proportionally from the other bins so the
+    total still equals target_points exactly).
+    """
+    bin_edges = np.asarray(bin_edges, dtype=np.float64)
+    n_bins = len(bin_edges) - 1
+    n_total = max(len(abs_sdf), 1)
+
+    bin_of_point = np.digitize(abs_sdf, bin_edges[1:-1], right=False)  # 0..n_bins-1
+    true_counts = np.array([(bin_of_point == b).sum() for b in range(n_bins)], dtype=np.float64)
+    true_fractions = true_counts / n_total
+
+    budget = true_fractions * target_points
+
+    near_wall_bins = [b for b in range(n_bins) if bin_edges[b + 1] <= 0.01 + 1e-9]
+    floor_total = near_wall_floor_fraction * target_points
+    near_wall_total = budget[near_wall_bins].sum() if near_wall_bins else 0.0
+
+    if near_wall_bins and near_wall_total < floor_total:
+        weights = true_fractions[near_wall_bins]
+        weights = weights / weights.sum() if weights.sum() > 1e-9 else np.full(len(near_wall_bins), 1.0 / len(near_wall_bins))
+        deficit = floor_total - near_wall_total
+
+        other_bins = [b for b in range(n_bins) if b not in near_wall_bins]
+        other_total = budget[other_bins].sum()
+        if other_total > 1e-9:
+            shrink = max(0.0, (other_total - deficit) / other_total)
+            budget[other_bins] *= shrink
+
+        for b, w in zip(near_wall_bins, weights):
+            budget[b] += deficit * w
+
+    bin_budget = np.round(budget).astype(int)
+    drift = target_points - bin_budget.sum()
+    if n_bins > 0:
+        bin_budget[np.argmax(bin_budget)] += drift  # absorb rounding drift in the largest bin
+    return np.clip(bin_budget, 0, None), bin_of_point
+
+
+def sdf_stratified_downsample(
     coords: np.ndarray,
     sdf: np.ndarray,
     normals: np.ndarray,
     velocity: np.ndarray,
     pressure: np.ndarray,
     target_points: int,
-    boundary_ratio: float = 0.80
 ):
     """
-    Intelligently downsample while preserving boundary geometry.
-
-    Strategy:
-    - Keep more points near airfoil (high information density), selected
-      with a voxel pre-filter + farthest point sampling for good spatial
-      coverage of the geometry.
-    - Sparse, plain random sampling in the freestream (flow is smooth and
-      slowly varying there, so exact spatial coverage isn't important),
-      which is far cheaper than FPS at these point counts.
-    - Use SDF to identify boundary regions.
+    Downsample by explicit |sdf| stratification instead of a loose
+    boundary/field split. Each bin's budget (see compute_bin_budget) matches
+    or exceeds that bin's true share of the full mesh, so the near-wall
+    viscous sublayer is no longer systematically thinned out relative to
+    the real mesh's own refinement. Within each bin, points are chosen the
+    same way the old boundary sampling did (voxel pre-filter + FPS) for
+    bins near the wall, or plain uniform random for bins entirely in the
+    smooth far field.
     """
+    abs_sdf = np.abs(sdf)
+    bin_budget, bin_of_point = compute_bin_budget(abs_sdf, target_points)
+    bin_edges = np.asarray(SDF_BIN_EDGES, dtype=np.float64)
 
-    n_boundary = int(target_points * boundary_ratio)
-    n_field = target_points - n_boundary
+    final_indices = []
+    for b in range(len(bin_budget)):
+        n_b = int(bin_budget[b])
+        if n_b <= 0:
+            continue
+        bin_indices = np.where(bin_of_point == b)[0]
+        if len(bin_indices) == 0:
+            continue
+        if len(bin_indices) <= n_b:
+            final_indices.append(bin_indices)
+            continue
 
-    # Identify boundary points: those very close to airfoil
-    # |SDF| < 0.5 means close to surface (negative = inside, positive = outside)
-    boundary_mask = np.abs(sdf) < 0.5
-    field_mask = ~boundary_mask
-
-    boundary_indices = np.where(boundary_mask)[0]
-    field_indices = np.where(field_mask)[0]
-
-    # Boundary sampling: voxel pre-filter to shrink the set, then FPS on the
-    # much smaller remainder to preserve geometric structure.
-    if len(boundary_indices) > n_boundary:
-        prefilter_target = min(len(boundary_indices), n_boundary * VOXEL_PREFILTER_FACTOR)
-        prefiltered_local = voxel_prefilter(coords[boundary_indices], prefilter_target)
-        boundary_candidates = boundary_indices[prefiltered_local]
-
-        if len(boundary_candidates) > n_boundary:
-            boundary_sampled = farthest_point_sample(
-                coords[boundary_candidates], n_boundary
-            )
-            boundary_idx_final = boundary_candidates[boundary_sampled]
+        if bin_edges[b] >= FPS_SDF_CUTOFF:
+            chosen_local = np.random.choice(len(bin_indices), size=n_b, replace=False)
         else:
-            boundary_idx_final = boundary_candidates
-    else:
-        boundary_idx_final = boundary_indices
-        n_field = target_points - len(boundary_idx_final)
+            prefilter_target = min(len(bin_indices), n_b * VOXEL_PREFILTER_FACTOR)
+            prefiltered_local = voxel_prefilter(coords[bin_indices], prefilter_target)
+            if len(prefiltered_local) > n_b:
+                fps_local = farthest_point_sample(coords[bin_indices][prefiltered_local], n_b)
+                chosen_local = prefiltered_local[fps_local]
+            else:
+                chosen_local = prefiltered_local
+        final_indices.append(bin_indices[chosen_local])
 
-    # Field sampling: plain uniform random sampling (cheap, and sufficient
-    # since the freestream field is smooth and doesn't need FPS coverage).
-    if len(field_indices) > n_field:
-        field_idx_final = np.random.choice(field_indices, size=n_field, replace=False)
-    else:
-        field_idx_final = field_indices
+    final_indices = np.concatenate(final_indices) if final_indices else np.arange(0)
 
-    # Combine indices
-    final_indices = np.concatenate([boundary_idx_final, field_idx_final])
-
-    # Subsample all per-node arrays
     coords_down = coords[final_indices]
     sdf_down = sdf[final_indices]
     normals_down = normals[final_indices]
@@ -271,7 +353,7 @@ def prepare_dataset(
 
     print(f"\nPreparing {dataset_size} samples for GATr")
     print(f"Target: {target_points} points per sample")
-    print(f"Boundary ratio: {BOUNDARY_RATIO:.1%}")
+    print(f"SDF-stratified sampling: near-wall (|sdf|<0.01) floor = {NEAR_WALL_FLOOR_FRACTION:.0%} of budget")
 
     stats_all = []
 
@@ -292,9 +374,9 @@ def prepare_dataset(
         normalized_full, stats = nondimensionalize(freestream, velocity, pressure)
 
         # Downsample
-        coords_down, sdf_down, normals_down, vel_down, press_down, _ = boundary_aware_downsample(
+        coords_down, sdf_down, normals_down, vel_down, press_down, _ = sdf_stratified_downsample(
             coords, sdf, normals, normalized_full['velocity'], normalized_full['pressure'],
-            target_points, BOUNDARY_RATIO
+            target_points
         )
 
         # Save
@@ -315,11 +397,15 @@ def prepare_dataset(
         )
 
         # Track statistics (convert numpy types to Python native for JSON serialization)
+        near_wall_frac_full = float((np.abs(sdf) < 0.01).mean())
+        near_wall_frac_down = float((np.abs(sdf_down) < 0.01).mean())
         stats_all.append({
             'sample_id': int(idx),
             'n_points': int(len(coords)),
             'n_points_down': int(len(coords_down)),
             'boundary_ratio': float((np.abs(sdf_down) < 0.5).mean()),
+            'near_wall_frac_full_mesh': near_wall_frac_full,
+            'near_wall_frac_downsampled': near_wall_frac_down,
             'v_inf_mag': stats['v_inf_mag'],
             'pressure_range': [float(pressure.min()), float(pressure.max())],
             'velocity_mag_range': [float(np.linalg.norm(velocity, axis=1).min()),
@@ -332,7 +418,12 @@ def prepare_dataset(
     print(f"\nDataset Statistics:")
     print(f"  Avg compression: {np.mean([s['n_points'] for s in stats_all]):.0f} → "
           f"{np.mean([s['n_points_down'] for s in stats_all]):.0f} points")
-    print(f"  Avg boundary ratio: {np.mean([s['boundary_ratio'] for s in stats_all]):.1%}")
+    print(f"  Avg boundary ratio (|sdf|<0.5): {np.mean([s['boundary_ratio'] for s in stats_all]):.1%}")
+    print(f"  Near-wall (|sdf|<0.01) fraction — full mesh:   "
+          f"{np.mean([s['near_wall_frac_full_mesh'] for s in stats_all]):.1%}")
+    print(f"  Near-wall (|sdf|<0.01) fraction — downsampled: "
+          f"{np.mean([s['near_wall_frac_downsampled'] for s in stats_all]):.1%}  "
+          f"(should now be >= the full-mesh figure, not ~2% as before)")
     print(f"  Freestream speed range: [{min(s['v_inf_mag'] for s in stats_all):.2f}, "
           f"{max(s['v_inf_mag'] for s in stats_all):.2f}]")
 
@@ -340,7 +431,8 @@ def prepare_dataset(
     metadata = {
         'n_samples': dataset_size,
         'target_points': target_points,
-        'boundary_ratio': BOUNDARY_RATIO,
+        'sdf_bin_edges': list(SDF_BIN_EDGES),
+        'near_wall_floor_fraction': NEAR_WALL_FLOOR_FRACTION,
         'sample_stats': stats_all
     }
 
