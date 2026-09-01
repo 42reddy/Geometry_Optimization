@@ -106,10 +106,10 @@ THRESHOLDS = {
 def load_model(checkpoint_path: Path) -> nn.Module:
     model = FlowFieldPipeline(
         input_scalar_dim=6,
-        mv_channels=4,
-        scalar_channels=8,
-        n_heads=2,
-        n_encoder_layers=4,
+        mv_channels=8,
+        scalar_channels=12,
+        n_heads=4,
+        n_encoder_layers=8,
         grid_resolution=GRID_RESOLUTION,
         grid_bounds=GRID_BOUNDS,
         grid_stretch_center=GRID_STRETCH_CENTER,
