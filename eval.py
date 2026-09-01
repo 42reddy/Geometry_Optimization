@@ -1,21 +1,11 @@
 """
-Evaluate trained FlowFieldPipeline on the FULL held-out AirfRANS validation
-split (the exact same split train.py produced, reconstructed here with the
-same SEED — evaluating on training samples would give falsely optimistic
+Evaluate trained FlowFieldPipeline on the held-out AirfRANS validation split
+(the exact same split train.py produced, reconstructed here with the same
+SEED — evaluating on training samples would give falsely optimistic
 metrics).
 
-The model still ENCODES the downsampled ~9k point cloud from data.npz (its
-trained input distribution) via encode_to_grid(), but is DECODED at the full
-~180k-point mesh from full.npz (written by prepare_gatr.py, nondimensionalized
-identically to data.npz). This measures true full-resolution error instead of
-error on the training point cloud, which is disproportionately boundary-heavy
-(and therefore disproportionately hard) relative to the full mesh — the easy,
-smooth far-field points that the model already predicts well are 20x
-underrepresented in the 9k cloud, so error measured there understates how
-good the model actually is. GridDecoder is a continuous bilinear interpolant,
-so querying it at points other than the encoder's input is exactly what it's
-designed for. Falls back to downsampled-only evaluation (with a warning) if
-full.npz isn't present, e.g. for data prepared before this eval mode existed.
+The model both ENCODES and is DECODED at the downsampled ~9k point cloud
+from data.npz (prepare_gatr.py doesn't save a full-resolution mesh).
 
 
 Two kinds of quantities are reported, and they are NOT interchangeable:
@@ -89,9 +79,9 @@ from torch.utils.data import DataLoader
 from train import (
     AirfRANSGATrDataset, set_seed, SEED, VAL_FRACTION, CHECKPOINT_DIR, DATA_DIR,
     GRID_BOUNDS, GRID_RESOLUTION, GRID_STRETCH_CENTER, GRID_STRETCH_GAMMA,
-    USE_NEAR_WALL_CORRECTION, NEAR_WALL_K, NEAR_WALL_HIDDEN, NEAR_WALL_WALL_SCALE,
 )
 from pipeline import FlowFieldPipeline
+from prepare_gatr import SDF_LOG_EPS
 
 # CONFIG
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -115,7 +105,7 @@ THRESHOLDS = {
 
 def load_model(checkpoint_path: Path) -> nn.Module:
     model = FlowFieldPipeline(
-        input_scalar_dim=7,
+        input_scalar_dim=6,
         mv_channels=4,
         scalar_channels=8,
         n_heads=2,
@@ -130,10 +120,6 @@ def load_model(checkpoint_path: Path) -> nn.Module:
         fno_layers=4,
         fno_modes=16,
         n_outputs=3,
-        use_near_wall_correction=USE_NEAR_WALL_CORRECTION,
-        near_wall_k=NEAR_WALL_K,
-        near_wall_hidden=NEAR_WALL_HIDDEN,
-        near_wall_wall_scale=NEAR_WALL_WALL_SCALE,
     ).to(DEVICE)
 
     model.load_state_dict(torch.load(checkpoint_path, map_location=DEVICE, weights_only=True))
@@ -544,15 +530,6 @@ def main():
     pooled_v_err, pooled_p_err = [], []
     band_stats = new_band_accumulator()
 
-    full_res_available = False #(dataset.sample_dirs[0] / "full.npz").exists()
-    if full_res_available:
-        print("full.npz found — evaluating against the FULL ~180k-point mesh "
-              "(model still encodes only the downsampled ~9k input cloud).\n")
-    else:
-        print("WARNING: full.npz not found — falling back to evaluating on the "
-              "downsampled ~9k point cloud only. Rerun prepare_gatr.py to get "
-              "true full-resolution metrics.\n")
-
     print(f"Evaluating {len(val_set)} samples...")
     with torch.no_grad():
         for loop_i, (coords, node_scalars, target) in enumerate(val_loader):
@@ -563,26 +540,18 @@ def main():
             node_scalars = node_scalars.squeeze(0).to(DEVICE)
             target = target.squeeze(0).to(DEVICE)
 
-            fno_out, point_ctx = model.encode_to_grid(coords, node_scalars)
+            fno_out = model.encode_to_grid(coords, node_scalars)
 
-            if full_res_available:
-                full = np.load(sample_dir / "full.npz")
-                query_coords = torch.from_numpy(full['coords']).float().to(DEVICE)
-                sdf = full['sdf']
-                normals = full['normals']
-                target_np = np.concatenate(
-                    [full['velocity'], full['pressure'][:, None]], axis=-1
-                )
-                query_sdf = torch.from_numpy(sdf).float().to(DEVICE)
-            else:
-                query_coords = coords
-                sdf = node_scalars[:, 2].cpu().numpy()
-                # column layout: [freestream_x, freestream_y, sdf, log_sdf, normal_x, normal_y, log_v_inf]
-                normals = node_scalars[:, 4:6].cpu().numpy()
-                target_np = target.cpu().numpy()
-                query_sdf = node_scalars[:, 2]
+            query_coords = coords
+            # node_scalars[:, 2] is sdf_log (see train.py) — invert
+            # encode_wall_normal's asinh stretch back to raw sdf for the
+            # physical sdf-banded diagnostics below.
+            sdf_log_np = node_scalars[:, 2].cpu().numpy()
+            sdf = np.sign(sdf_log_np) * np.sinh(np.abs(sdf_log_np)) * SDF_LOG_EPS
+            normals = node_scalars[:, 3:5].cpu().numpy()
+            target_np = target.cpu().numpy()
 
-            pred = model.decode(fno_out, query_coords, point_ctx=point_ctx, query_sdf=query_sdf)
+            pred = model.decode(fno_out, query_coords)
 
             coords_np = query_coords.cpu().numpy()
             pred_np = pred.cpu().numpy()

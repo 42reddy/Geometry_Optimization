@@ -5,6 +5,11 @@ prepared AirfRANS samples from data/airfrans_gatr/.
 Sample schema (per sample_XXXXX/data.npz, written by prepare_gatr.py):
     coords     (N, 2)  point coordinates, chord-normalized (chord = 1), raw
     sdf        (N,)    signed distance to airfoil surface, raw
+    sdf_log    (N,)    sign(sdf) * asinh(|sdf| / eps) — wall-normal coordinate
+                        fed to the network instead of raw sdf: raw sdf
+                        compresses the whole boundary layer into a tiny
+                        numeric range near 0, while this stretches it (see
+                        encode_wall_normal in prepare_gatr.py).
     normals    (N, 2)  unit surface normals, raw
     freestream (2,)    inlet velocity, nondimensionalized: freestream / |V_inf|
     velocity   (N, 2)  target velocity, nondimensionalized: velocity / |V_inf|
@@ -19,17 +24,8 @@ physical units — training itself operates entirely in nondimensional space,
 so samples with very different inlet speeds/Reynolds numbers contribute
 comparably to the loss instead of the fastest-flow samples dominating it).
 
-Training and validation now run on the FULL ~180k-point mesh from
-sample_XXXXX/full.npz (also written by prepare_gatr.py), not the ~9k
-boundary-aware downsampled cloud in data.npz — see FULL_RESOLUTION below.
-full.npz has per-point coords/sdf/normals/velocity/pressure but not the two
-per-sample scalar features (freestream direction, log|V_inf|), which are
-still read from data.npz and broadcast the same way. This trains on the
-mesh's true point density directly (roughly half of which sits in the
-near-wall boundary layer — see grid_stretch.py) instead of on a downsampled
-approximation of it. It costs meaningfully more: GATr's k-NN graph attention
-scales with point count, so a full-res sample has ~20x the edges of the
-downsampled one.
+Training and validation run on the ~9k-point boundary-aware downsampled
+cloud in data.npz (prepare_gatr.py doesn't save the full-resolution mesh).
 """
 
 import random
@@ -49,11 +45,6 @@ CHECKPOINT_DIR = Path("checkpoints")
 SEED = 0
 
 VAL_FRACTION = 0.1
-# Train on the full ~180k-point mesh (full.npz) instead of the ~9k
-# boundary-aware downsampled cloud (data.npz). Set False to fall back to the
-# downsampled cloud if the full-resolution point count is too much for
-# available GPU memory (GATr's k-NN attention scales with point count).
-FULL_RESOLUTION = False
 EPOCHS = 25
 LR = 3e-4
 WEIGHT_DECAY = 1e-5
@@ -87,12 +78,6 @@ PHYSICS_WEIGHT = 0.02
 # interpolant instead of spanning multiple cells.
 PHYSICS_EPS = 0.02
 
-# log1p(|sdf|/SDF_LOG_EPS) scale for the wall-normal coordinate feature —
-# see AirfRANSGATrDataset.__getitem__. ~half of prepare_gatr.py's finest
-# SDF_BIN_EDGES entry (0.0025), so the log expansion is centered on the
-# same near-wall range the sampling stratifies most finely.
-SDF_LOG_EPS = 0.00125
-
 MV_CHANNELS = 4
 SCALAR_CHANNELS = 8
 N_HEADS = 2
@@ -119,19 +104,6 @@ FNO_HIDDEN_CHANNELS = 32
 FNO_LAYERS = 4
 FNO_MODES = 16
 
-# Local near-wall correction branch (near_wall_correction.NearWallCorrector),
-# added on top of FNO's global spectral prediction. FNO's SpectralConv2d
-# keeps only FNO_MODES Fourier modes, which band-limits how sharp a
-# gradient it can represent -- the boundary layer is sharper than that
-# no matter how well the grid is stretched or the input sampled. This
-# branch reuses GATr's per-node features via local cross-attention and is
-# gated to fade out away from the wall (see NEAR_WALL_WALL_SCALE), so it
-# only ever corrects the region the global field is known to struggle in.
-USE_NEAR_WALL_CORRECTION = True
-NEAR_WALL_K = 8
-NEAR_WALL_HIDDEN = 32
-NEAR_WALL_WALL_SCALE = 0.05   # chord units -- gate ~= exp(-|sdf|/this)
-
 VAL_EVERY = 1
 # ================
 
@@ -144,28 +116,13 @@ def set_seed(seed: int) -> None:
 
 
 class AirfRANSGATrDataset(Dataset):
-    """Reads prepared per-sample NPZ files and assembles GATrEncoder's node_scalars.
+    """Reads prepared per-sample NPZ files (data.npz, written by
+    prepare_gatr.py) and assembles GATrEncoder's node_scalars."""
 
-    full_res=True (default) reads the full ~180k-point mesh from full.npz
-    instead of the ~9k downsampled cloud in data.npz — data.npz is still
-    read for the two per-sample scalar features (freestream direction,
-    log|V_inf|) that aren't stored per-point in full.npz. Defaulting to True
-    here (rather than only in train.py's config) means eval.py's dataset
-    construction — which doesn't pass full_res explicitly — automatically
-    stays consistent with whatever train.py was actually trained on.
-    """
-
-    def __init__(self, data_dir: Path, full_res: bool = True):
+    def __init__(self, data_dir: Path):
         self.sample_dirs = sorted(d for d in data_dir.iterdir() if d.is_dir())
         if not self.sample_dirs:
             raise RuntimeError(f"No samples found in {data_dir} — run prepare_gatr.py first.")
-        self.full_res = full_res
-        if full_res and not (self.sample_dirs[0] / "full.npz").exists():
-            raise RuntimeError(
-                f"full_res=True but {self.sample_dirs[0]}/full.npz not found — "
-                f"rerun prepare_gatr.py (it now also saves the full-resolution mesh) "
-                f"or pass full_res=False to train on the downsampled cloud instead."
-            )
 
     def __len__(self) -> int:
         return len(self.sample_dirs)
@@ -176,43 +133,18 @@ class AirfRANSGATrDataset(Dataset):
         freestream = torch.from_numpy(data['freestream']).float()
         log_v_inf = torch.tensor(float(data['log_v_inf']))
 
-        if self.full_res:
-            full = np.load(sample_dir / "full.npz")
-            coords = torch.from_numpy(full['coords']).float()
-            sdf = torch.from_numpy(full['sdf']).float()
-            normals = torch.from_numpy(full['normals']).float()
-            velocity = torch.from_numpy(full['velocity']).float()
-            pressure = torch.from_numpy(full['pressure']).float()
-        else:
-            coords = torch.from_numpy(data['coords']).float()
-            sdf = torch.from_numpy(data['sdf']).float()
-            normals = torch.from_numpy(data['normals']).float()
-            velocity = torch.from_numpy(data['velocity']).float()
-            pressure = torch.from_numpy(data['pressure']).float()
+        coords = torch.from_numpy(data['coords']).float()
+        sdf_log = torch.from_numpy(data['sdf_log']).float()
+        normals = torch.from_numpy(data['normals']).float()
+        velocity = torch.from_numpy(data['velocity']).float()
+        pressure = torch.from_numpy(data['pressure']).float()
 
         n = coords.shape[0]
         freestream_bc = freestream.unsqueeze(0).expand(n, -1)   # broadcast to every node
         log_v_inf_bc = log_v_inf.expand(n).unsqueeze(-1)        # broadcast to every node
-
-        # Signed log wall-normal coordinate, alongside raw sdf. Raw sdf
-        # compresses the entire boundary layer (physically ~0.001-0.01
-        # chord thick) into a numeric range a few percent of the input's
-        # total span, right next to points at sdf~1-3 chord away -- the
-        # network sees almost no separation between "at the wall" and
-        # "just outside the boundary layer". log1p(|sdf|/SDF_LOG_EPS),
-        # signed to keep inside/outside distinguishable, is the standard
-        # CFD-ML fix (cf. wall-normal y+ coordinates): it stretches
-        # exactly the near-wall range where gradients are steep and
-        # compresses the already-smooth far field where resolution isn't
-        # needed. SDF_LOG_EPS is set to roughly half the finest
-        # sdf-stratification bin edge used in prepare_gatr.py, so the
-        # transition from "expanded" to "log-compressed" lines up with
-        # where the sampling actually starts concentrating points.
-        log_sdf = torch.sign(sdf) * torch.log1p(sdf.abs() / SDF_LOG_EPS)
-
         node_scalars = torch.cat(
-            [freestream_bc, sdf.unsqueeze(-1), log_sdf.unsqueeze(-1), normals, log_v_inf_bc], dim=-1
-        )   # (N, 7): [freestream_x, freestream_y, sdf, log_sdf, normal_x, normal_y, log_v_inf]
+            [freestream_bc, sdf_log.unsqueeze(-1), normals, log_v_inf_bc], dim=-1
+        )   # (N, 6)
         target = torch.cat([velocity, pressure.unsqueeze(-1)], dim=-1)                   # (N, 3)
 
         return coords, node_scalars, target
@@ -243,12 +175,6 @@ def continuity_residual_loss(model, fno_out: torch.Tensor, coords: torch.Tensor,
     ex = coords.new_tensor([eps, 0.0])
     ey = coords.new_tensor([0.0, eps])
 
-    # Uses the plain global (grid) decode -- point_ctx/query_sdf omitted --
-    # since this soft prior is meant to regularize FNO's smooth global
-    # field towards divergence-free; it isn't meant to reach into the
-    # near-wall correction branch, whose sharp local gradients would make
-    # a finite-difference estimate over PHYSICS_EPS noisy and whose sdf at
-    # the shifted query points isn't cheaply available here anyway.
     pred_xp = model.decode(fno_out, coords + ex)
     pred_xm = model.decode(fno_out, coords - ex)
     pred_yp = model.decode(fno_out, coords + ey)
@@ -294,9 +220,8 @@ def run_epoch(model, loader, optimizer, device, epoch: int, train: bool,
         target = target.squeeze(0).to(device)
 
         with torch.set_grad_enabled(train):
-            fno_out, point_ctx = model.encode_to_grid(coords, node_scalars)
-            query_sdf = node_scalars[:, 2]   # raw sdf column, see AirfRANSGATrDataset
-            pred = model.decode(fno_out, coords, point_ctx=point_ctx, query_sdf=query_sdf)   # query at the same points used as input
+            fno_out = model.encode_to_grid(coords, node_scalars)
+            pred = model.decode(fno_out, coords)   # query at the same points used as input
 
             physics_loss = pred.new_zeros(())
             if physics_weight > 0:
@@ -331,9 +256,8 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    dataset = AirfRANSGATrDataset(DATA_DIR, full_res=FULL_RESOLUTION)
-    print(f"Training on {'FULL ~180k-point' if FULL_RESOLUTION else '~9k downsampled'} "
-          f"meshes per sample")
+    dataset = AirfRANSGATrDataset(DATA_DIR)
+    print(f"Training on ~9k downsampled meshes per sample")
     check_grid_bounds(dataset, GRID_BOUNDS)
 
     n_val = max(1, int(len(dataset) * VAL_FRACTION))
@@ -347,7 +271,7 @@ def main():
     val_loader = DataLoader(val_set, batch_size=1, shuffle=False)
 
     model = FlowFieldPipeline(
-        input_scalar_dim=7,
+        input_scalar_dim=6,
         mv_channels=MV_CHANNELS,
         scalar_channels=SCALAR_CHANNELS,
         n_heads=N_HEADS,
@@ -362,10 +286,6 @@ def main():
         fno_layers=FNO_LAYERS,
         fno_modes=FNO_MODES,
         n_outputs=3,
-        use_near_wall_correction=USE_NEAR_WALL_CORRECTION,
-        near_wall_k=NEAR_WALL_K,
-        near_wall_hidden=NEAR_WALL_HIDDEN,
-        near_wall_wall_scale=NEAR_WALL_WALL_SCALE,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
