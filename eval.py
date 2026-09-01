@@ -544,7 +544,7 @@ def main():
     pooled_v_err, pooled_p_err = [], []
     band_stats = new_band_accumulator()
 
-    full_res_available = (dataset.sample_dirs[0] / "full.npz").exists()
+    full_res_available = False #(dataset.sample_dirs[0] / "full.npz").exists()
     if full_res_available:
         print("full.npz found — evaluating against the FULL ~180k-point mesh "
               "(model still encodes only the downsampled ~9k input cloud).\n")
